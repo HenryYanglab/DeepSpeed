@@ -23,6 +23,7 @@ FastOffload 是面向 DeepSpeed ZeRO-Offload 的实验性扩展框架，目标�
 - [论文与当前实现差距分析](PAPER_IMPLEMENTATION_GAP_ANALYSIS.md)
 - [Overview 图绘制需求简述](OVERVIEW_FIGURE_BRIEF.md)
 - [Overview 图详细提示词与规范](OVERVIEW_FIGURE_PROMPT.md)
+- [实验软硬件环境与版本](EXPERIMENT_ENVIRONMENT.md)
 - [Observer 配置](CONFIGURATION.md)
 - [DeepSpeed 适配层](adapters/README.md)
 - [策略模块](policies/README.md)
