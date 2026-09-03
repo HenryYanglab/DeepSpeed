@@ -18,6 +18,7 @@ FastOffload 是面向 DeepSpeed ZeRO-Offload 的实验性扩展框架，目标�
 
 ## 文档
 
+- [当前实现状态与功能清单](IMPLEMENTATION_STATUS.md)
 - [总体架构设计](DESIGN.md)
 - [Hybrid sparse/dense update 设计](HYBRID_UPDATE_DESIGN.md)
 - [论文与当前实现差距分析](PAPER_IMPLEMENTATION_GAP_ANALYSIS.md)
