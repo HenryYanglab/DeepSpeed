@@ -1,0 +1,36 @@
+{
+  "enabled": true,
+  "mode": "async_offload",
+  "zero_stage": 2,
+  "failure_policy": "raise",
+  "policy": {
+    "type": "all_offload"
+  },
+  "scheduler": {
+    "type": "overlap",
+    "max_inflight_tasks": 4,
+    "max_inflight_bytes": 2147483648
+  },
+  "transfer": {
+    "pin_memory": true,
+    "cpu_staging": false,
+    "async_strategy": "producer_stream",
+    "buffer_count": 4,
+    "buffer_size": 134217728
+  },
+  "worker": {
+    "type": "inline"
+  },
+  "telemetry": {
+    "log_interval": 10,
+    "parameter_events": true,
+    "bucket_events": true,
+    "host_timing": true,
+    "device_timing": false,
+    "memory_metrics": false,
+    "distributed_summary": false,
+    "rank_mode": "rank0_local",
+    "debug_event_buffer_size": 0,
+    "max_parameter_name_length": 128
+  }
+}

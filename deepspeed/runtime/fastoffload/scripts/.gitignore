@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# DeepSpeed Team
+
+output/
+benchmark_results/
+shadow_validation_results/

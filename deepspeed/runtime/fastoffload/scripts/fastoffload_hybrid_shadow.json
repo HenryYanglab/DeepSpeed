@@ -1,0 +1,44 @@
+{
+  "enabled": true,
+  "mode": "observe",
+  "zero_stage": 2,
+  "failure_policy": "raise",
+  "importance": {
+    "enabled": true,
+    "algorithm": "pretrained_delta_topk",
+    "warmup_steps": 2,
+    "topk_ratio": 0.1,
+    "comparison_chunk_rows": 4096,
+    "sparse_backward": false,
+    "sparse_backward_min_tokens": 1024,
+    "output_path": null
+  },
+  "hybrid_update": {
+    "enabled": true,
+    "update_interval": 2,
+    "accumulation_device": "cpu",
+    "dense_boundary_enabled": true,
+    "double_buffer": true,
+    "second_gradient_reduction": "mean",
+    "max_async_lag": 1,
+    "overdue_policy": "wait",
+    "compressed_collective_shadow": true,
+    "compressed_bucket_bytes": 134217728,
+    "parity_atol": 0.001,
+    "parity_rtol": 0.001
+  },
+  "telemetry": {
+    "log_interval": 1,
+    "parameter_events": true,
+    "bucket_events": true,
+    "host_timing": true,
+    "device_timing": false,
+    "memory_metrics": true,
+    "distributed_summary": false,
+    "rank_mode": "rank0_local",
+    "debug_event_buffer_size": 0,
+    "max_parameter_name_length": 128,
+    "jsonl_path": null,
+    "csv_path": null
+  }
+}

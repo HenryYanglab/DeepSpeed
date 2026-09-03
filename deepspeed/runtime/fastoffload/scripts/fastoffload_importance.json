@@ -1,0 +1,28 @@
+{
+  "enabled": true,
+  "mode": "observe",
+  "zero_stage": 2,
+  "failure_policy": "raise",
+  "importance": {
+    "enabled": true,
+    "algorithm": "pretrained_delta_topk",
+    "warmup_steps": 10,
+    "topk_ratio": 0.1,
+    "comparison_chunk_rows": 4096,
+    "sparse_backward": true,
+    "sparse_backward_min_tokens": 1024,
+    "output_path": null
+  },
+  "telemetry": {
+    "log_interval": 10,
+    "parameter_events": true,
+    "bucket_events": true,
+    "host_timing": true,
+    "device_timing": false,
+    "memory_metrics": true,
+    "distributed_summary": false,
+    "rank_mode": "rank0_local",
+    "debug_event_buffer_size": 0,
+    "max_parameter_name_length": 128
+  }
+}

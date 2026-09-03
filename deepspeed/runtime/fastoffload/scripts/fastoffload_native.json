@@ -1,0 +1,20 @@
+{
+  "enabled": false,
+  "mode": "observe",
+  "zero_stage": 2,
+  "failure_policy": "raise",
+  "telemetry": {
+    "log_interval": 10,
+    "parameter_events": false,
+    "bucket_events": false,
+    "host_timing": false,
+    "device_timing": false,
+    "memory_metrics": false,
+    "distributed_summary": false,
+    "rank_mode": "rank0_local",
+    "debug_event_buffer_size": 0,
+    "max_parameter_name_length": 128,
+    "jsonl_path": null,
+    "csv_path": null
+  }
+}

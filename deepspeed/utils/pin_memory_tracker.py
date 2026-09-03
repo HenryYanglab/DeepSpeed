@@ -51,6 +51,9 @@ class _PinnedMemoryTracker:
             logger.info(msg)
             self._next_checkpoint *= 2
 
+    def snapshot(self) -> dict:
+        return {"cumulative_bytes": self._bytes, "allocation_calls": self._calls}
+
     def log_summary(self, tag: str = "") -> None:
         prefix = f"[pinned-memory {tag}] " if tag else "[pinned-memory] "
         logger.info(f"{prefix}{_fmt_bytes(self._bytes)} pinned across {self._calls} allocations")
@@ -61,6 +64,11 @@ _tracker = _PinnedMemoryTracker()
 
 def track_pinned_memory(num_bytes: int) -> None:
     _tracker.track(num_bytes)
+
+
+def pinned_memory_stats() -> dict:
+    """Return process-local cumulative accelerator pinning statistics."""
+    return _tracker.snapshot()
 
 
 def pinned_memory_summary(tag: str = "") -> None:

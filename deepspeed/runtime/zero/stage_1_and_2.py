@@ -19,6 +19,7 @@ from typing import Container
 from deepspeed.runtime.zero.offload_states import offload_optimizer_states, reload_optimizer_states
 from deepspeed.runtime.base_optimizer import ZeROOptimizer
 from deepspeed.runtime.fp16.loss_scaler import CreateLossScaler
+from deepspeed.runtime.fastoffload.api import create_zero2_controller
 from deepspeed.runtime.torch_autocast import get_autocast_dtype, get_all_comm_dtypes, is_autocast_initialized, sort_dtypes
 from deepspeed.runtime.utils import (empty_cache, see_memory_usage, inf, is_model_parallel_parameter,
                                      align_dense_tensors, all_gather_dp_groups, mask_nan_or_inf_with_val_inplace,
@@ -55,6 +56,7 @@ OPTIMIZER_GRADIENTS_TIMER = 'optimizer_gradients'
 OPTIMIZER_STEP_TIMER = 'optimizer_step'
 OPTIMIZER_TIMERS = [OPTIMIZER_ALLGATHER_TIMER, OPTIMIZER_GRADIENTS_TIMER, OPTIMIZER_STEP_TIMER]
 INITIAL_MICRO_STEP_ID = -1
+FASTOFFLOAD_HYBRID_STATE = "fastoffload_hybrid_state"
 
 
 def input(msg):
@@ -675,6 +677,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self._create_optimizer_mapping()
 
         self.offloaded_states: Set[OffloadStateTypeEnum] = set()
+        self._fastoffload_controller = create_zero2_controller(self)
 
     def destroy(self):
         for i, _ in enumerate(self.optimizer.param_groups):
@@ -685,6 +688,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             hook.remove()
         self.print_rank_0("Removed grad acc hooks")
         self._unpin_offload_buffers()
+        self._fastoffload_controller.close()
 
     def _unpin_offload_buffers(self):
         # Release the page-locked host buffers we pinned for CPU offload. unpin_memory is a
@@ -918,7 +922,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
     def independent_gradient_partition_epilogue(self):
         self.report_ipg_memory_usage("In ipg_epilogue before reduce_ipg_grads", 0)
-        self.reduce_ipg_grads()
+        if (not self._fastoffload_controller.takeover_active()
+                or self._fastoffload_controller.takeover_native_boundary()):
+            self.reduce_ipg_grads()
         self.report_ipg_memory_usage("In ipg_epilogue after reduce_ipg_grads", 0)
 
         # if dist.get_rank() == 0:
@@ -1025,6 +1031,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         Note: param.grad is cleared in the epilogue via _clear_param_grad_only() to
         ensure safe_get_full_grad() works correctly. Only grad_accum is deferred.
         """
+        self._fastoffload_controller.prepare_forward()
         if self._epilogue_ran_this_backward:
             # Clear grad_accum for next step. param.grad is already cleared in epilogue.
             for group in self.bit16_groups:
@@ -1207,6 +1214,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if not getattr(param, "ds_grad_is_ready", True):
             return
 
+        gradient_taken_over = self._fastoffload_controller.on_gradient_ready(param, i)
+        if gradient_taken_over:
+            return
         self._maybe_reduce_autoep_folding_tp_gradient(param, grad_reduc)
         param_id = self.get_param_id(param)
         assert self.params_already_reduced[param_id] == False, \
@@ -1656,12 +1666,17 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 self._offload_accumulated_param_ids.add(self.get_param_id(param))
 
             if self.is_gradient_accumulation_boundary():
+                self._fastoffload_controller.validate_native_gradient(param,
+                                                                      self.grad_position[self.get_param_id(param)][0])
                 self.set_norm_for_param_grad_in_gpu(param)
 
                 self.update_offload_overflow_tracker_for_param_grad(param)
 
-                self.async_inplace_copy_grad_to_fp32_buffer_from_gpu(param)
+                gradient_transferred = self._fastoffload_controller.transfer_gradient(param)
+                if not gradient_transferred:
+                    self.async_inplace_copy_grad_to_fp32_buffer_from_gpu(param)
 
+            self._fastoffload_controller.on_gradient_reduced(param, self.grad_position[self.get_param_id(param)][0])
             return
         #print(f"ID {self.get_param_id(param)} grad norm {param.grad.norm()}")
         if self.grads_in_partition is None:
@@ -1749,6 +1764,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     else:  # zero stage 1 - partition only optimizer state
                         if self.contiguous_gradients and self.is_param_in_current_partition[param_id]:
                             self.copy_grads_in_partition(param)
+                if bucket.params:
+                    self._fastoffload_controller.on_gradient_bucket(comm_dtype, bucket)
                 bucket.clear()
         #####################################################################
 
@@ -2278,9 +2295,26 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         """
         Not supporting closure.
         """
+        self._fastoffload_controller.prepare_step()
+        self._fastoffload_controller.on_step_begin()
         self.micro_step_id = INITIAL_MICRO_STEP_ID
         if self.cpu_offload:
             self._offload_accumulated_param_ids = set()
+
+        takeover_result = self._fastoffload_controller.takeover_step(self.loss_scale, self.clip_grad)
+        if takeover_result is not None:
+            self.overflow = takeover_result.numerics.overflow
+            self._global_grad_norm = takeover_result.numerics.global_norm
+            self._update_scale(self.overflow)
+            self.zero_grad(set_to_none=True)
+            self._release_preflattened_grad_buffers()
+            if self.cpu_offload:
+                self.reset_cpu_buffers()
+            for timer in OPTIMIZER_TIMERS:
+                self.timers(timer).start()
+                self.timers(timer).stop()
+            self._fastoffload_controller.on_step_end()
+            return
 
         see_memory_usage("In step before checking overflow")
 
@@ -2306,6 +2340,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             for timer in OPTIMIZER_TIMERS:
                 self.timers(timer).start()
                 self.timers(timer).stop()
+            self._fastoffload_controller.on_step_end()
             return
 
         # Step 1:- Calculate gradient norm using bit-16 grads
@@ -2405,6 +2440,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.timers.log(OPTIMIZER_TIMERS)
         see_memory_usage('After zero_optimizer step')
 
+        self._fastoffload_controller.on_step_end()
         return
 
     @torch.no_grad()
@@ -2513,10 +2549,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
             self.ready_for_gradients = True
 
+    def backward_prologue(self):
+        self._fastoffload_controller.on_backward_begin()
+
     def backward_epilogue(self, *args, **kwargs):
         # Only for Stage 1, Mode 2
         if self.use_grad_accum_attribute:
             self.fill_grad_accum_attribute()
+        self._fastoffload_controller.on_backward_end()
 
     def check_overflow(self, partition_gradients=True):
         self._check_overflow(partition_gradients)
@@ -2632,6 +2672,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         autotp_uc_info = self._get_universal_checkpoint_info()
         if autotp_uc_info is not None:
             state_dict[UNIVERSAL_CHECKPOINT_INFO] = autotp_uc_info
+
+        hybrid_state = self._fastoffload_controller.hybrid_state_dict()
+        if hybrid_state is not None:
+            state_dict[FASTOFFLOAD_HYBRID_STATE] = hybrid_state
 
         return state_dict
 
@@ -2865,6 +2909,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         if load_optimizer_states:
             self._link_all_hp_params()
+        self._fastoffload_controller.load_hybrid_state_dict(current_rank_sd.get(FASTOFFLOAD_HYBRID_STATE))
 
     def _clear_hp_buffer_references(self):
         """
