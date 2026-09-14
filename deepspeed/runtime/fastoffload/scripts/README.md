@@ -107,6 +107,42 @@ python deepspeed/runtime/fastoffload/scripts/benchmark_selective_backward.py \
 
 A800、BF16、323 tokens 的样例结果显示：attention Q、MLP gate/up、MLP down 的估算 Linear backward speedup 分别约为 1.06x、1.10x、1.17x；KV projection 因 output features 较小而约为 0.75x。默认 `sparse_backward_min_output_features=1024` 因此跳过小 output projection。该 benchmark 只用于 kernel 选择，不代表端到端训练性能。
 
+## GPU-only ceiling diagnostic
+
+`benchmark_gpu_ceiling.py` measures the GPU-side lower-work reference, **not a valid training method or a mathematical
+throughput bound**. It temporarily installs a diagnostic runtime; the production Hybrid A/B/C runtime is unchanged.
+
+It retains full forward, ordinary packed A/B backward, full dense-boundary backward, gradient reduction, global numerics,
+owner A GPUAdam, and A all-gather. After the initial native importance warmup it disables B/C state migration, CPU jobs,
+B accumulation, gradient D2H, parameter H2D, and B/C publication. Guard functions fail if a disabled CPU path is invoked.
+B/C remain frozen, so loss/convergence and model export are not supported. Omitting B accumulation/publication makes this
+an optimistic ceiling diagnostic, not an isolated semantics-preserving CPU-overlap ablation.
+
+The script preloads the finite input window to GPU, removing batch H2D as well. Native importance warmup and initial A
+state migration still use CPU/GPU transfers, but must complete before the timed window. Scalar norm/overflow control,
+host kernel-launch work, and inter-GPU collectives are retained. It reports all-rank padded/input/supervised token sums,
+maximum-rank synchronized wall time, maximum-rank measured-window allocated/reserved peaks, and per-rank CUDA-event
+forward/backward/A-step stream elapsed times (including gaps/waits, not pure kernel time). No per-step synchronization is
+added except the existing dense-boundary publication synchronization.
+
+From the DeepSpeed repository root, using a run-specific FastOffload config with distinct telemetry output paths:
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 deepspeed --master_port 29618 \
+  deepspeed/runtime/fastoffload/scripts/benchmark_gpu_ceiling.py \
+  --model_name_or_path /data/Qwen2.5-7B-Instruct \
+  --dataset_path /data/hangyu/datasets/alpaca \
+  --deepspeed_config deepspeed/runtime/fastoffload/scripts/deepspeed_zero2_cpu_offload.json \
+  --fastoffload_config /path/to/run/fastoffload.json \
+  --max_steps 100 --benchmark_warmup_steps 20 --max_length 512 \
+  --gradient_accumulation_steps 1 --learning_rate 5e-6 --no-save_model \
+  --benchmark_jsonl /path/to/run/benchmark.jsonl
+```
+
+Use the takeover settings in `fastoffload_qwen7b_alpaca_epoch.json`; only GAS=1, constant LR and one epoch are supported.
+The measured window must contain complete update intervals. Runtime monkeypatching is scoped to this standalone process
+and restored on exit; never enable this diagnostic in a production fine-tuning run or export it as a Hybrid checkpoint.
+
 ## Hybrid Shadow 验证
 
 Shadow 验证脚本使用相同 seed、模型、数据和训练参数依次运行 Native control 与 Hybrid shadow。它验证：

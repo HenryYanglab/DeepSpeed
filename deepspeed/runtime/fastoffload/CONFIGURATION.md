@@ -167,11 +167,39 @@ config = FastOffloadConfig.from_dict({
 
 `zero2_takeover` 默认 `false`，并且不能与 `compressed_collective_shadow` 同时启用。启用后，importance warmup 仍走原生 ZeRO-2；选择完成后，A/B/C 梯度改用 owner-padded reduce-scatter，A 由 owner-local GPU Adam 每步更新，B/C 和 bias/norm 由异步 CPU Adam 在 interval boundary 更新，更新值通过 compressed all-gather 发布。Takeover 支持 GAS 和 unused parameters，并迁移原生 owner Adam moments。当前要求所有 optimizer parameter group 使用相同 Adam 超参数。设置 `importance.sparse_backward=true` 后，受支持的 Linear 在普通步骤使用 packed-gradient side channel；未包装模块仍生成 dense autograd gradient，但只通信和更新 A+B。DeepSpeed 已经按 GAS 缩放各 microbatch loss，因此 Takeover 对 compressed microbatch gradients 使用 sum，避免重复除以 GAS。
 
-Takeover checkpoint 保存 importance layout、A/B/C optimizer state、successful-step/version 和活跃 B accumulator。存在未提交异步 CPU job 时会拒绝 checkpoint，调用方应先在 forward boundary 或 interval backpressure 点完成提交。
+Takeover checkpoint 保存 importance layout、A/B/C optimizer state、successful-step/version 和活跃 B accumulator；保存前排空已提交CPU job并等待参数可见，不为末尾部分B额外生成C更新。LR scheduler状态仍由DeepSpeed管理，不包含在单独的Hybrid state字典中。
 
 `compressed_bucket_bytes` 同时限制 Shadow 和 Takeover 待打包参数集合的目标大小。Takeover 按 parameter ID 确定性分桶，对每个桶独立执行 owner-padded reduce-scatter、更新和 all-gather，并在下一个桶前释放临时 packed tensor。单个参数不会被拆分，因此参数数据的目标上限是 `max(compressed_bucket_bytes, largest_compressed_parameter_bytes)`；owner padding 可能使实际 collective allocation 更高，实际值记录在 `takeover_owner_bucket_peak_bytes`。Shadow 归约结果在完成 native parity 和 owner partition 校验后立即释放，不再保留整模型 packed buffer。`parity_atol` 和 `parity_rtol` 控制 compressed/native、norm 和 owner-value 比对容差。
 
 Shadow 目前校验 owner-rank 对应元素的 compressed collective 数值、有限性/overflow 决策、L2 norm，以及 D2H 后 ZeRO FP32 flat partition 的 owner offset/value。尚未用压缩结果替换 ZeRO-2 optimizer step，因此该开关用于分布式正确性和通信量验证，而不是性能训练。
+
+## Takeover学习率scheduler
+
+LR scheduler配置写在 **DeepSpeed主配置** 中，不是FastOffload配置里的传输 `scheduler` 字段。
+标准DeepSpeed LR scheduler更新Native optimizer的LR；每个成功Takeover step经Adapter读取当前值给A，dense boundary的B/C任务固定使用该步A的同一LR。
+CPU即使排队到后续step才执行，也不会改用后来的LR。构造时的 `_lr` / `_native_hyperparameters` 不再代表当前调度LR，审计应读取实际step/job参数。
+
+例如，在主配置已有optimizer（峰值LR=2e-6）、GAS1的情况下，可以添加以下配置片段：
+
+```json
+{
+  "scheduler": {
+    "type": "WarmupCosineLR",
+    "params": {
+      "total_num_steps": 1024,
+      "warmup_num_steps": 32,
+      "warmup_min_ratio": 0.1,
+      "cos_min_ratio": 0.1
+    }
+  }
+}
+```
+
+这是接线示例，不是已完成的1024步LLM调参结果。`total_num_steps`以scheduler/成功optimizer更新为单位；GAS大于1时不能直接当作microstep数。
+LR warmup与importance warmup不同；如果Native importance预热期间LR一直为0，pretrained-delta无法观察学习引起的权重变化，应联合检查两种warmup设置。
+不改变B的mean/sum累积方式或C的边界梯度语义，不将LR额外乘/除update_interval。LR=0合法，负值/NaN/Inf和组间不同LR会被拒绝。
+当前只同步LR，不能使用同时改变betas、eps或weight decay的调度配置。Overflow不推进scheduler；旧的有效CPU任务仍用提交时LR完成。
+恢复完整训练还需恢复Native optimizer和scheduler状态；真实大模型optimizer-state resume仍未完成验证。
 
 ## 约束
 

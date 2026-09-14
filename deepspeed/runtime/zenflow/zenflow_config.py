@@ -31,7 +31,12 @@ class ZenFlowConfig(DeepSpeedConfigModel):
     """Whether to overlap CPU-side optimizer steps with forward/backward computation."""
 
     offload: bool = False
-    """Whether to offload selective optimizer states to CPU to save memory."""
+    """Whether to offload selective optimizer states to CPU to save memory.
+
+    This pages selective Adam moments for updates, not the replicated model weights.
+    ZeRO-1/2 initialization separately budgets the flat output and contiguous transpose
+    buffers, falling back to CPU flattening when their combined GPU workspace does not fit.
+    """
 
     auto_ratio: float = Field(0.99, ge=0.0, le=1.0)
     """Threshold used in the "auto" strategy to determine update_interval."""

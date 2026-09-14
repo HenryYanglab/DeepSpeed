@@ -2,8 +2,9 @@
 # DeepSpeed Team
 """AdamW state and updates for compressed selected-column values."""
 
+import math
 from dataclasses import dataclass
-from typing import Any, Dict, Hashable, Mapping
+from typing import Any, Dict, Hashable, Mapping, Optional
 
 import torch
 
@@ -24,8 +25,8 @@ class SelectedColumnAdamW:
                  betas: tuple[float, float] = (0.9, 0.999),
                  eps: float = 1e-8,
                  weight_decay: float = 0.0) -> None:
-        if lr < 0.0:
-            raise ValueError("lr must be non-negative")
+        if not math.isfinite(lr) or lr < 0.0:
+            raise ValueError("lr must be finite and non-negative")
         if not 0.0 <= betas[0] < 1.0 or not 0.0 <= betas[1] < 1.0:
             raise ValueError("Adam betas must be in [0, 1)")
         if eps <= 0.0:
@@ -38,7 +39,14 @@ class SelectedColumnAdamW:
         self._weight_decay = weight_decay
         self._states: Dict[Hashable, _AdamState] = {}
 
-    def step_values(self, key: Hashable, values: torch.Tensor, gradient: torch.Tensor) -> torch.Tensor:
+    def step_values(self,
+                    key: Hashable,
+                    values: torch.Tensor,
+                    gradient: torch.Tensor,
+                    lr: Optional[float] = None) -> torch.Tensor:
+        lr = self._lr if lr is None else float(lr)
+        if not math.isfinite(lr) or lr < 0.0:
+            raise ValueError("lr must be finite and non-negative")
         if values.shape != gradient.shape:
             raise ValueError("Selected values and gradient shapes must match")
         state = self._states.get(key)
@@ -55,12 +63,12 @@ class SelectedColumnAdamW:
         state.step += 1
         grad = gradient.detach().float()
         if self._weight_decay:
-            state.master_values.mul_(1.0 - self._lr * self._weight_decay)
+            state.master_values.mul_(1.0 - lr * self._weight_decay)
         state.exp_avg.mul_(self._beta1).add_(grad, alpha=1.0 - self._beta1)
         state.exp_avg_sq.mul_(self._beta2).addcmul_(grad, grad, value=1.0 - self._beta2)
         bias_correction1 = 1.0 - self._beta1**state.step
         bias_correction2 = 1.0 - self._beta2**state.step
-        step_size = self._lr / bias_correction1
+        step_size = lr / bias_correction1
         denominator = state.exp_avg_sq.sqrt().div_(bias_correction2**0.5).add_(self._eps)
         state.master_values.addcdiv_(state.exp_avg, denominator, value=-step_size)
         return state.master_values.to(dtype=values.dtype)

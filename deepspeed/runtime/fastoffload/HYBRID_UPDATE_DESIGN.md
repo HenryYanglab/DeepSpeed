@@ -42,6 +42,28 @@ submit mean(B[1:N]) + C[N] to asynchronous CPU updater
 
 The B update uses the mean of all N B gradients. The C update uses only the current boundary gradient. A must be excluded from the CPU job to prevent a duplicate update.
 
+### 2.3 Learning-rate synchronization in owner-sharded Takeover
+
+The Native optimizer's parameter-group LR remains the scheduler authority. Before each successful Takeover update,
+`Zero2ObserverAdapter` reads one finite, non-negative LR shared by all optimizer groups. Both compressed ordinary steps
+and streamed Native dense boundaries pass that scalar explicitly to GPU A. At a dense boundary, B/C receive **the same
+LR used by A at submission**, frozen as `HybridUpdateJob.lr`. The coordinator preserves it across the D2H-event wait,
+and the spawned CPUAdam receives it with the gradient-slot command. The small-state CPU fallback uses the same job LR.
+A newer scheduler value must not change a queued/running job; changing LR does not drain the queue or delay publication.
+
+For example, after one Native importance-warmup step with interval4, B/C submissions at steps5/9 use A's LR at steps5/9,
+not the LR when the CPU eventually executes them. B still uses the period's mean gradient (including the boundary), C
+still uses only the boundary gradient, and neither the LR nor B gradients are reweighted by earlier per-step LRs.
+Zero LR is valid: Adam moments/step counters advance, but parameter updates and decoupled weight decay use zero LR.
+
+DeepSpeed continues to advance its LR scheduler after successful optimizer steps, not on non-boundary GAS microsteps
+or overflow. Native importance warmup uses that same scheduler-controlled optimizer; LR warmup is a separate schedule.
+Checkpoint/shutdown drain already submitted jobs using their captured LRs. Restoring the Native optimizer LR and scheduler
+state controls the next Takeover step; no queued LR is serialized because Hybrid checkpointing drains pending work first.
+The constructor LR remains a default for standalone updater calls, not an audit source for the current scheduled LR.
+Only LR is synchronized: differing group LRs and schedules that also change betas/eps/weight decay are not supported.
+This wiring does not establish scheduler quality benefits or real-model optimizer-state resume correctness.
+
 ## 3. Accumulation device
 
 `accumulation_device` is configurable and defaults to `cpu`.
@@ -112,6 +134,23 @@ worker result ready
 ```
 
 Training may use stale B/C values while a CPU job is running. At most `max_async_lag` uncommitted versions are allowed. Dense boundaries reuse Native ZeRO-2 gradient-ready buckets: every layer still computes its full gradient, but each reduced owner fragment is split immediately. A/B remain on GPU, while C is copied directly into its version-owned shared+pinned BF16 gradient slot and the dense fragment is released with the Native bucket. No full-model GPU gradient or GPU staging tensor is created. A final CUDA event gates one native DeepSpeedCPUAdam call in the worker. Large CPUAdam jobs cast updated FP32 masters once into a persistent shared+pinned model-dtype return buffer. Publication copies selected values nonblocking from this low-precision mirror and records an explicit visibility event; the next forward waits on that event, and the CPU process cannot reuse the return buffer until visibility completes. The FP32 master and moments remain canonical CPU state. Bucket membership is computed from the global logical payload rather than rank-local owner counts so every rank issues exactly the same collective sequence. Checkpoint and shutdown paths drain and publish one globally ready version at a time. The training thread never waits for CPUAdam during ordinary steps unless bounded-lag backpressure is reached.
+
+### Shared transfer-buffer registration
+
+Each gradient slot and return mirror is one complete shared allocation and one CUDA host registration. If initialization
+returns `cudaErrorInvalidValue` (numeric code 1), the updater first synchronizes CUDA to surface preceding asynchronous
+errors and consumes only the expected registration last-error value (0/1), then makes **one** retry with fresh shared storage.
+A successful registration does not itself clear a prior CUDA last error; leaving code 1 pending makes the next unrelated
+kernel's launch check fail. Older PyTorch bindings omit `cudaGetLastError`, so this recovery resolves it through PyTorch's
+loaded extension, using the same CUDA runtime rather than loading an arbitrary toolkit library. The failed mapping stays alive while its replacement is
+allocated, preventing immediate reuse of the same address. This is bounded recovery for an intermittent registration
+failure, not proof of its underlying driver/allocation cause. Healthy initialization adds no allocation or synchronization.
+
+The replacement is wired into both the training-side slot table and spawned CPUAdam arguments before any job is submitted.
+It retains the original dtype, size and version ownership. No buffer is independently registered in slices: one D2H/H2D
+copy can cross such slices and fail. A retry warns and increments `takeover_host_register_retry_count`. A repeated failure,
+a different CUDA status, or a synchronization failure aborts initialization and unregisters earlier successful allocations.
+The retry may temporarily require one additional CPU allocation per affected slot; it introduces no GPU staging buffer.
 
 ## 7. Optimizer ownership
 

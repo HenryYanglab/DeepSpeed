@@ -138,9 +138,9 @@ class Zero2TakeoverGradientPipeline:
                                         values.index_select(1, second_positions).detach())
 
     def finish_microbatch(self) -> TakeoverGradientBatch | None:
-        first_boundary = self._first_accumulator.accumulate(self._micro_first)
-        second_boundary = self._second_accumulator.accumulate(self._micro_second)
-        dense_boundary = self._dense_accumulator.accumulate(self._micro_dense)
+        first_boundary = self._first_accumulator.accumulate(self._micro_first, take_ownership=True)
+        second_boundary = self._second_accumulator.accumulate(self._micro_second, take_ownership=True)
+        dense_boundary = self._dense_accumulator.accumulate(self._micro_dense, take_ownership=True)
         self._micro_first = {}
         self._micro_second = {}
         self._micro_dense = {}

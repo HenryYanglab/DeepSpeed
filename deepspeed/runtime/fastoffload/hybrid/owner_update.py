@@ -2,7 +2,7 @@
 # DeepSpeed Team
 """Owner-local GPU optimizer for first-important takeover values."""
 
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, Optional
 
 import torch
 
@@ -33,8 +33,10 @@ class Zero2OwnerGpuUpdater:
         self._optimizer.initialize_state((parameter_id, "first_owner"), values, moments, variances, step)
 
     @torch.no_grad()
-    def step(self, reduced_by_group: Mapping[int, OwnerReducedGradientSet], columns: Mapping[int,
-                                                                                             torch.Tensor]) -> int:
+    def step(self,
+             reduced_by_group: Mapping[int, OwnerReducedGradientSet],
+             columns: Mapping[int, torch.Tensor],
+             lr: Optional[float] = None) -> int:
         updated_elements = 0
         for group_id, reduced_set in sorted(reduced_by_group.items()):
             for reduced in getattr(reduced_set, "buckets", (reduced_set, )):
@@ -46,7 +48,7 @@ class Zero2OwnerGpuUpdater:
                     except KeyError as error:
                         raise RuntimeError(
                             f"Owner GPU optimizer state is unavailable for parameter {parameter_id}") from error
-                    updated = self._optimizer.step_values(key, values, gradient)
+                    updated = self._optimizer.step_values(key, values, gradient, lr=lr)
                     # The Hybrid master is canonical; rebuilding sparse flat offsets every step costs more than Adam.
                     updated_values[parameter_id] = updated
                     updated_elements += updated.numel()

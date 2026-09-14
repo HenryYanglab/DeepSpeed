@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 
+import pytest
 import torch
 
 import deepspeed
@@ -54,7 +55,8 @@ class TestZero2ObserverIntegration(DistributedTest):
                   importance=False,
                   hybrid_shadow=False,
                   takeover=False,
-                  optimizer_steps=1):
+                  optimizer_steps=1,
+                  with_scheduler=False):
         hidden_dim = 8
         torch.manual_seed(1234)
         model = SimpleModel(hidden_dim)
@@ -75,6 +77,16 @@ class TestZero2ObserverIntegration(DistributedTest):
             "zero_force_ds_cpu_optimizer": False,
         }
         config.update(precision_config())
+        if with_scheduler:
+            config["scheduler"] = {
+                "type": "WarmupCosineLR",
+                "params": {
+                    "total_num_steps": 8,
+                    "warmup_num_steps": 2,
+                    "warmup_min_ratio": 0.5,
+                    "cos_min_ratio": 0.1,
+                },
+            }
 
         fastoffload_config = {
             "enabled": mode is not None,
@@ -129,7 +141,14 @@ class TestZero2ObserverIntegration(DistributedTest):
                 labels = torch.randint(0, hidden_dim, (1, ), device=engine.device)
                 loss = engine(inputs, labels)
                 engine.backward(loss)
+                boundary = engine.is_gradient_accumulation_boundary()
+                if with_scheduler:
+                    lr_before = optimizer.param_groups[0]["lr"]
+                    scheduler_state = clone_state(engine.lr_scheduler.state_dict())
                 engine.step()
+                if with_scheduler and not boundary:
+                    assert optimizer.param_groups[0]["lr"] == lr_before
+                    assert_state_equal(scheduler_state, engine.lr_scheduler.state_dict())
 
             state = {name: value.detach().cpu().clone() for name, value in engine.module.state_dict().items()}
             optimizer_state = clone_state(engine.optimizer.optimizer.state_dict())
@@ -214,7 +233,8 @@ class TestZero2ObserverIntegration(DistributedTest):
         loss, state, _, metrics = self._run_step(mode="observe",
                                                  gradient_accumulation_steps=2,
                                                  takeover=True,
-                                                 optimizer_steps=3)
+                                                 optimizer_steps=3,
+                                                 with_scheduler=True)
 
         assert torch.isfinite(loss)
         assert all(torch.isfinite(value).all() for value in state.values())
@@ -231,12 +251,17 @@ class TestZero2ObserverIntegration(DistributedTest):
         assert "hybrid_shadow_owner_write_mismatch_count" not in metrics.counters
         assert metrics.gauges["hybrid_shadow_bucket_peak_bytes"] <= 128
 
-    def test_gradient_accumulation_matches_native_zero(self):
-        _, baseline_state, baseline_optimizer_state, _ = self._run_step(mode=None, gradient_accumulation_steps=2)
+    @pytest.mark.parametrize("with_scheduler", [False, True])
+    def test_gradient_accumulation_matches_native_zero(self, with_scheduler):
+        _, baseline_state, baseline_optimizer_state, _ = self._run_step(mode=None,
+                                                                        gradient_accumulation_steps=2,
+                                                                        with_scheduler=with_scheduler)
         _, sync_state, sync_optimizer_state, sync_metrics = self._run_step(mode="sync_offload",
-                                                                           gradient_accumulation_steps=2)
+                                                                           gradient_accumulation_steps=2,
+                                                                           with_scheduler=with_scheduler)
         _, async_state, async_optimizer_state, async_metrics = self._run_step(mode="async_offload",
-                                                                              gradient_accumulation_steps=2)
+                                                                              gradient_accumulation_steps=2,
+                                                                              with_scheduler=with_scheduler)
 
         assert baseline_state.keys() == sync_state.keys()
         assert baseline_state.keys() == async_state.keys()
@@ -255,9 +280,13 @@ class TestZero2ObserverIntegration(DistributedTest):
 
 class TestZero2TakeoverTwoRanks(DistributedTest):
     world_size = 2
+    non_daemonic_procs = True
 
-    def test(self):
-        hidden_dim = 8
+    @pytest.mark.parametrize("hidden_dim,register_failure,with_scheduler", [(8, False, False), (2048, False, False),
+                                                                            (2048, True, False), (8, False, True),
+                                                                            (2048, False, True)])
+    def test(self, hidden_dim, register_failure, with_scheduler):
+        # The larger owner shard must exercise shared registration and the spawned CPUAdam process.
         torch.manual_seed(1234)
         model = SimpleModel(hidden_dim)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -292,6 +321,7 @@ class TestZero2TakeoverTwoRanks(DistributedTest):
                 "update_interval": 2,
                 "zero2_takeover": True,
                 "compressed_bucket_bytes": 32,
+                "max_async_lag": 2,
             },
             "telemetry": {
                 "host_timing": False,
@@ -299,10 +329,76 @@ class TestZero2TakeoverTwoRanks(DistributedTest):
             },
         })
         engine = None
+        patches = pytest.MonkeyPatch()
+        factors = (1.0, 0.8, 0.6, 0.4, 0.2, 0.1, 0.0, 0.0)
+        gpu_lrs, cpu_lrs, native_lrs = [], [], []
+
+        def make_scheduler(basic_optimizer):
+            return torch.optim.lr_scheduler.LambdaLR(basic_optimizer, lambda step: factors[min(step,
+                                                                                               len(factors) - 1)])
+
         try:
-            engine, _, _, _ = deepspeed.initialize(model=model, optimizer=optimizer, config=config)
+            engine, _, _, _ = deepspeed.initialize(model=model,
+                                                   optimizer=optimizer,
+                                                   config=config,
+                                                   lr_scheduler=make_scheduler if with_scheduler else None)
+            runtime = engine.optimizer._fastoffload_controller._takeover_runtime
+            updater = runtime._cpu_updater
+            if with_scheduler:
+                gpu_step = runtime._gpu_updater.step
+                cpu_update = updater._coordinator._update_function
+                native_step = updater._native_step
+
+                def audit_gpu(gradients, columns, lr=None):
+                    assert lr == optimizer.param_groups[0]["lr"]
+                    gpu_lrs.append(lr)
+                    return gpu_step(gradients, columns, lr=lr)
+
+                def audit_cpu(job):
+                    assert job.lr == 1e-3 * factors[2 * job.version]
+                    cpu_lrs.append(job.lr)
+                    return cpu_update(job)
+
+                def audit_native(gradient, version, lr):
+                    # Compare canonical FP32 state, not the BF16 publication, so ignoring a job LR cannot hide in rounding.
+                    reference = torch.nn.Parameter(updater._native_parameter.detach().clone())
+                    _, betas, eps, weight_decay = updater._native_hyperparameters
+                    adam = torch.optim.AdamW([reference], lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+                    adam.state[reference] = {
+                        "step": torch.tensor(float(updater._optimizer.state_step(updater._native_keys[0]))),
+                        "exp_avg": updater._native_exp_avg.clone(),
+                        "exp_avg_sq": updater._native_exp_avg_sq.clone(),
+                    }
+                    reference.grad = gradient.float().clone()
+                    adam.step()
+                    result = native_step(gradient, version, lr)
+                    torch.testing.assert_close(updater._native_parameter, reference, rtol=1e-4, atol=1e-6)
+                    torch.testing.assert_close(updater._native_exp_avg, adam.state[reference]["exp_avg"])
+                    torch.testing.assert_close(updater._native_exp_avg_sq, adam.state[reference]["exp_avg_sq"])
+                    native_lrs.append(lr)
+                    return result
+
+                patches.setattr(runtime._gpu_updater, "step", audit_gpu)
+                patches.setattr(updater._coordinator, "_update_function", audit_cpu)
+                patches.setattr(updater, "_native_step", audit_native)
             torch.manual_seed(5678)
-            for _ in range(4):
+            if register_failure:
+                cudart = torch.cuda.cudart()  #ignore-cuda
+                native_register = cudart.cudaHostRegister
+                failed = []
+
+                def fail_once(address, nbytes, flags):
+                    if not failed:
+                        failed.append(True)
+                        # A real synchronous CUDA error also leaves a thread-local last-error value behind.
+                        status = native_register(address, 0, flags)
+                        assert int(status) == 1
+                        return status
+                    return native_register(address, nbytes, flags)
+
+                patches.setattr(cudart, "cudaHostRegister", fail_once)
+            steps = 8 if hidden_dim == 2048 else 4
+            for _ in range(steps):
                 inputs = torch.randn(1, hidden_dim, device=engine.device, dtype=engine.module.linears[0].weight.dtype)
                 labels = torch.randint(0, hidden_dim, (1, ), device=engine.device)
                 loss = engine(inputs, labels)
@@ -314,10 +410,30 @@ class TestZero2TakeoverTwoRanks(DistributedTest):
                 dist.all_reduce(mean)
                 mean.div_(dist.get_world_size())
                 assert torch.allclose(parameter, mean)
+            runtime = engine.optimizer._fastoffload_controller._takeover_runtime
+            retries = runtime._cpu_updater._metrics.snapshot().counters.get("takeover_host_register_retry_count", 0)
         finally:
-            if engine is not None:
-                engine.destroy()
-            handle.close()
+            try:
+                if engine is not None:
+                    engine.destroy()
+                handle.close()
+            finally:
+                patches.undo()
+        if with_scheduler:
+            assert gpu_lrs == [1e-3 * factor for factor in factors[1:steps]]
+            assert cpu_lrs == [1e-3 * factors[step - 1] for step in range(3, steps + 1, 2)]
+            assert native_lrs == (cpu_lrs if hidden_dim == 2048 else [])
+        if hidden_dim == 2048:
+            updater = runtime._cpu_updater
+            assert retries == int(register_failure)
+            assert updater._native_process.exitcode == 0
+            assert updater.pending_updates == 0
+            assert updater.committed_version == 3
+            assert len(updater._native_gradients) == 2
+            assert updater._native_registered_buffers == ()
+            assert updater._native_parameter.dtype == torch.float32
+            assert updater._native_gradients[0].dtype == next(engine.module.parameters()).dtype
+            assert updater._native_return_parameters[0].dtype == updater._native_gradients[0].dtype
 
     def test_overflow_and_checkpoint_drain(self):
         hidden_dim = 8
@@ -326,6 +442,15 @@ class TestZero2TakeoverTwoRanks(DistributedTest):
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         enable_selective_linear(model, minimum_tokens=1)
         config = {
+            "scheduler": {
+                "type": "WarmupCosineLR",
+                "params": {
+                    "total_num_steps": 12,
+                    "warmup_num_steps": 2,
+                    "warmup_min_ratio": 0.5,
+                    "cos_min_ratio": 0.1,
+                },
+            },
             "train_batch_size": 2,
             "train_micro_batch_size_per_gpu": 1,
             "gradient_accumulation_steps": 1,
@@ -375,9 +500,19 @@ class TestZero2TakeoverTwoRanks(DistributedTest):
 
             runtime = engine.optimizer._fastoffload_controller._takeover_runtime
             assert runtime.pending_updates == 1
+            scheduler_state = clone_state(engine.lr_scheduler.state_dict())
+            optimizer_state = clone_state(optimizer.state_dict())
+            lr_before = optimizer.param_groups[0]["lr"]
             checkpoint = engine.optimizer._fastoffload_controller.hybrid_state_dict()
             assert runtime.pending_updates == 0
+            assert_state_equal(scheduler_state, engine.lr_scheduler.state_dict())
+            optimizer.param_groups[0]["lr"] = 0.123
+            engine.lr_scheduler.step()
+            optimizer.load_state_dict(optimizer_state)
+            engine.lr_scheduler.load_state_dict(scheduler_state)
             engine.optimizer._fastoffload_controller.load_hybrid_state_dict(checkpoint)
+            assert runtime._adapter.get_learning_rate() == lr_before
+            assert_state_equal(scheduler_state, engine.lr_scheduler.state_dict())
 
             parameters_before_overflow = [parameter.detach().clone() for parameter in engine.module.parameters()]
             inputs = torch.randn(1, hidden_dim, device=engine.device, dtype=engine.module.linears[0].weight.dtype)
@@ -386,6 +521,11 @@ class TestZero2TakeoverTwoRanks(DistributedTest):
             engine.backward(loss)
             engine.step()
             assert engine.optimizer.overflow
+            assert runtime._adapter.get_learning_rate() == lr_before
+            assert_state_equal(scheduler_state, engine.lr_scheduler.state_dict())
+            assert runtime._pipeline._successful_steps == 2
+            assert runtime._cpu_updater.committed_version == 1
+            assert runtime.pending_updates == 0
             for before, parameter in zip(parameters_before_overflow, engine.module.parameters()):
                 assert torch.equal(before, parameter)
 

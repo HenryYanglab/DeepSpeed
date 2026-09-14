@@ -124,6 +124,25 @@ def test_zero2_adapter_builds_step_and_gradient_contexts():
     assert second_backward.gradient_accumulation_boundary is True
 
 
+def test_zero2_adapter_reads_live_scheduler_lr_without_caching():
+    optimizer = FakeZero2Optimizer()
+    optimizer.optimizer = SimpleNamespace(param_groups=[{"lr": 0.1}, {"lr": 0.1}])
+    adapter = Zero2ObserverAdapter(optimizer)
+    assert adapter.get_learning_rate() == 0.1
+    for lr in (0.02, 0.0, 0.05):
+        for group in optimizer.optimizer.param_groups:
+            group["lr"] = lr
+        assert adapter.get_learning_rate() == lr
+
+
+@pytest.mark.parametrize("rates", [[], [0.1, 0.2], [-0.1], [float("nan")], [float("inf")]])
+def test_zero2_adapter_rejects_invalid_or_divergent_learning_rates(rates):
+    optimizer = FakeZero2Optimizer()
+    optimizer.optimizer = SimpleNamespace(param_groups=[{"lr": lr} for lr in rates])
+    with pytest.raises(ValueError):
+        Zero2ObserverAdapter(optimizer).get_learning_rate()
+
+
 def test_zero2_adapter_exposes_matrix_partition_layouts():
     optimizer = FakeZero2Optimizer()
     optimizer.parameter = torch.nn.Parameter(torch.zeros((2, 8), dtype=torch.float16))

@@ -2,6 +2,7 @@
 # DeepSpeed Team
 """ZeRO Stage 2 metadata adapter for the FastOffload observer."""
 
+import math
 import time
 from typing import Any, Iterable, Tuple
 
@@ -181,6 +182,16 @@ class Zero2ObserverAdapter(ObserverAdapter):
     def get_fp32_partition(self, group_id: int) -> Any:
         self._validate_group_id(group_id)
         return self._optimizer.single_partition_of_fp32_groups[group_id].view(-1)
+
+    def get_learning_rate(self) -> float:
+        """Read the scheduler-controlled LR without exposing ZeRO state to the runtime."""
+        rates = [float(group["lr"]) for group in self._optimizer.optimizer.param_groups]
+        if not rates or any(lr != rates[0] for lr in rates):
+            raise ValueError("ZeRO-2 takeover requires identical learning rates across optimizer groups")
+        lr = rates[0]
+        if not math.isfinite(lr) or lr < 0.0:
+            raise ValueError("Takeover learning rate must be finite and non-negative")
+        return lr
 
     def get_dense_adam_partition_state(self, group_id: int) -> tuple[int, Any, Any]:
         self._validate_group_id(group_id)

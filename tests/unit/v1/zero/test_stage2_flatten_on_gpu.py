@@ -3,7 +3,7 @@
 
 # DeepSpeed Team
 """
-Test that ZeRO Stage 1 and 2 use the GPU flatten path when VRAM is sufficient.
+Test ZeRO Stage 1/2 flatten placement, including ZenFlow transpose-workspace headroom.
 Parametrized over zero_stage (1, 2) and dtype (fp32, fp16, bf16).
 """
 
@@ -151,3 +151,83 @@ class TestStage2FlattenOnGPU(DistributedTest):
             loss = engine(batch[0], batch[1])
             engine.backward(loss)
             engine.step()
+
+
+@pytest.mark.parametrize("zenflow_offload", [None, False, True], ids=["native", "zenflow", "zenflow_offload"])
+@pytest.mark.parametrize("headroom", ["below_flat", "flat_only", "ample"])
+@pytest.mark.parametrize("dtype", ["fp32", "bf16"])
+class TestStage2FlattenMemoryBudget(DistributedTest):
+    world_size = 2
+
+    def test_flatten_placement_preserves_parameters(self, monkeypatch, zenflow_offload, headroom, dtype):
+        accelerator = get_accelerator()
+        if not accelerator.is_available():
+            pytest.skip("Accelerator not available")
+        config = {
+            "train_micro_batch_size_per_gpu": 2,
+            "gradient_accumulation_steps": 1,
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1e-3
+                }
+            },
+            "zero_optimization": {
+                "stage": 2,
+                "overlap_comm": True,
+                "offload_optimizer": {
+                    "device": "cpu",
+                    "pin_memory": True
+                }
+            }
+        }
+        _apply_dtype_to_config(config, dtype)
+        use_zenflow = zenflow_offload is not None
+        if use_zenflow:
+            config["zero_optimization"]["zenflow"] = {
+                "topk_ratio": 0.25,
+                "update_interval": 4,
+                "overlap_step": False,
+                "offload": zenflow_offload
+            }
+        torch.manual_seed(123)
+        model = SimpleModel(hidden_dim=64, nlayers=2).to(dtype=_DTYPE_MAP[dtype])
+        expected = {name: param.detach().clone() for name, param in model.named_parameters()}
+        group_numel = sum(param.numel() for param in model.parameters())
+        alignment = 2 * self.world_size
+        aligned_numel = (group_numel + alignment - 1) // alignment * alignment
+        flat_bytes = aligned_numel * next(model.parameters()).element_size()
+        available_bytes = {"below_flat": flat_bytes - 1, "flat_only": flat_bytes, "ample": 2 * flat_bytes}[headroom]
+        expect_cpu = headroom == "below_flat" or (use_zenflow and headroom == "flat_only")
+        messages = []
+        engine = None
+        try:
+            with monkeypatch.context() as patch:
+                # Simulate headroom between the flat output and output-plus-transpose without allocating a huge model.
+                patch.setattr(accelerator, "available_memory", lambda: available_bytes)
+                patch.setattr("deepspeed.utils.logger.info", lambda msg, *args, **kwargs: messages.append(str(msg)))
+                engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
+            expected_log = "on CPU (insufficient memory)" if expect_cpu else "(sufficient memory)"
+            assert any("Flattening param group" in msg and expected_log in msg for msg in messages)
+            for name, param in engine.module.named_parameters():
+                assert torch.equal(param.detach().cpu(), expected[name])
+                assert param.dtype == _DTYPE_MAP[dtype]
+                assert not hasattr(param, "cpu_data")
+            for flat in engine.optimizer.bit16_groups_flat:
+                assert flat.device.type == accelerator.device_name()
+                assert flat.grad_fn is None
+            data_loader = random_dataloader(model=engine,
+                                            total_samples=16,
+                                            hidden_dim=64,
+                                            device=engine.device,
+                                            dtype=_DTYPE_MAP[dtype])
+            for batch in data_loader:
+                loss = engine(batch[0], batch[1])
+                assert torch.isfinite(loss)
+                engine.backward(loss)
+                engine.step()
+            assert any(not torch.equal(param.detach().cpu(), expected[name])
+                       for name, param in engine.module.named_parameters())
+        finally:
+            if engine is not None:
+                engine.destroy()

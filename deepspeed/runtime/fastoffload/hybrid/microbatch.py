@@ -28,9 +28,14 @@ class CompressedMicrobatchAccumulator:
     def micro_steps(self) -> int:
         return self._micro_steps
 
-    def accumulate(self, gradients: Mapping[int, torch.Tensor]) -> bool:
+    def accumulate(self, gradients: Mapping[int, torch.Tensor], take_ownership: bool = False) -> bool:
         if self.is_boundary:
             raise RuntimeError("Compressed GAS boundary must be consumed before accumulating again")
+        if self._gas == 1 and take_ownership:
+            # The capture pipeline relinquishes these tensors immediately after this call.
+            self._gradients = {parameter_id: gradient.detach() for parameter_id, gradient in gradients.items()}
+            self._micro_steps = 1
+            return True
         for parameter_id, gradient in gradients.items():
             source = gradient.detach()
             target = self._gradients.get(parameter_id)
@@ -47,7 +52,10 @@ class CompressedMicrobatchAccumulator:
         if not self.is_boundary:
             raise RuntimeError("Compressed gradients have not reached the GAS boundary")
         scale = 1.0 / self._gas if self._reduction == "mean" else 1.0
-        result = {parameter_id: gradient.mul(scale) for parameter_id, gradient in self._gradients.items()}
+        result = self._gradients
+        if scale != 1.0:
+            for gradient in result.values():
+                gradient.mul_(scale)
         self._gradients = {}
         self._micro_steps = 0
         return result

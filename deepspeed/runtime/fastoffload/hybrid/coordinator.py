@@ -2,6 +2,7 @@
 # DeepSpeed Team
 """Versioned asynchronous coordination for hybrid CPU updates."""
 
+import math
 import os
 import threading
 import time
@@ -115,9 +116,15 @@ class HybridUpdateCoordinator:
         self._ensure_open()
         self._accumulator.accumulate(gradients)
 
-    def submit_boundary(self, second_gradients: Mapping[int, torch.Tensor],
-                        dense_gradients: Mapping[int, torch.Tensor]) -> int:
+    def submit_boundary(self,
+                        second_gradients: Mapping[int, torch.Tensor],
+                        dense_gradients: Mapping[int, torch.Tensor],
+                        lr: Optional[float] = None) -> int:
         self._ensure_open()
+        if lr is not None:
+            lr = float(lr)
+            if not math.isfinite(lr) or lr < 0.0:
+                raise ValueError("Hybrid job learning rate must be finite and non-negative")
         self.progress()
         if self.pending_updates >= self._max_async_lag:
             raise RuntimeError("Maximum asynchronous hybrid update lag reached")
@@ -155,7 +162,8 @@ class HybridUpdateCoordinator:
                               interval_steps=interval_steps,
                               second_gradients=cpu_second,
                               dense_gradients=cpu_dense,
-                              transfer_event=transfer_event)
+                              transfer_event=transfer_event,
+                              lr=lr)
         with self._lock:
             if transfer_sources:
                 self._transfer_sources[version] = transfer_sources
@@ -237,7 +245,8 @@ class HybridUpdateCoordinator:
                                   buffer_id=job.buffer_id,
                                   interval_steps=job.interval_steps,
                                   second_gradients=job.second_gradients,
-                                  dense_gradients=job.dense_gradients)
+                                  dense_gradients=job.dense_gradients,
+                                  lr=job.lr)
         self._accumulator.release_update_buffer(job.buffer_id)
         update_start = time.perf_counter_ns()
         updated_values = self._update_function(job)

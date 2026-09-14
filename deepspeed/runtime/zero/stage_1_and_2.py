@@ -389,19 +389,24 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             # not sure why apex was cloning the weights before flattening
             # removing cloning here
 
-            # Compute group size for memory check (need 2x model size on accelerator to flatten in place: params + flat copy)
+            # Original parameters stay live while flattening, so budget the additional allocations.
             orig_group_numel = sum(param.numel() for param in self.bit16_groups[i])
             alignment = self.nccl_start_alignment_factor * dist.get_world_size(group=self.real_dp_process_group[i])
             aligned_numel = int(math.ceil(orig_group_numel / alignment)) * alignment
             param_dtype = self.bit16_groups[i][0].dtype
             element_size = torch.tensor([], dtype=param_dtype).element_size()
             flat_buffer_bytes = aligned_numel * element_size
+            flatten_required_bytes = flat_buffer_bytes
+            if self.zenflow:
+                # ZenFlow retains contiguous transposed weights while concatenating the flat output.
+                for param in self.bit16_groups[i]:
+                    if param.dim() == 2 and not param.data.transpose(0, 1).is_contiguous():
+                        flatten_required_bytes += param.numel() * element_size
 
             empty_cache()
             accelerator = get_accelerator()
             available_memory = accelerator.available_memory() if accelerator.is_available() else 0
-            # Flatten on accelerator device if we have enough memory for the flat buffer
-            flatten_on_accelerator = (accelerator.is_available() and (available_memory >= flat_buffer_bytes))
+            flatten_on_accelerator = (accelerator.is_available() and (available_memory >= flatten_required_bytes))
 
             if not flatten_on_accelerator:
                 see_memory_usage(f"Before moving param group {i} to CPU")

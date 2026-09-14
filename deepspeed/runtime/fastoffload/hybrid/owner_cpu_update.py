@@ -2,11 +2,13 @@
 # DeepSpeed Team
 """Asynchronous owner-local CPU updates for Hybrid B/C and dense parameters."""
 
+import ctypes
 import math
 import os
 import threading
 import time
-from typing import Dict, Iterable, Mapping
+import warnings
+from typing import Dict, Iterable, Mapping, Optional
 
 import psutil
 
@@ -40,7 +42,8 @@ def _run_native_cpu_adam_process(master, exp_avg, exp_avg_sq, transfer_gradients
         command = command_queue.get()
         if command == "close":
             break
-        _, slot = command
+        _, slot, lr = command
+        optimizer.param_groups[0]["lr"] = lr
         gradient.copy_(transfer_gradients[slot])
         parameter.grad = gradient
         optimizer.step()
@@ -72,6 +75,7 @@ class Zero2OwnerCpuUpdater:
                  metrics=None,
                  pt_reserved_cores_perc: float = 0.25) -> None:
         self._adapter = adapter
+        self._metrics = metrics
         self._layouts = {layout.parameter_id: layout for layout in layouts}
         self._collectives = dict(collectives)
         self._optimizer = SelectedColumnAdamW(lr, betas, eps, weight_decay)
@@ -198,7 +202,8 @@ class Zero2OwnerCpuUpdater:
                         dense_by_group: Mapping[int, OwnerReducedGradientSet],
                         second_columns: Mapping[int, torch.Tensor],
                         dense_columns: Mapping[int, torch.Tensor],
-                        dense_scale: float = 1.0) -> int:
+                        dense_scale: float = 1.0,
+                        lr: Optional[float] = None) -> int:
         self._initialize_states(second_by_group, second_columns, self._SECOND_TAG)
         self._initialize_states(dense_by_group, dense_columns, self._DENSE_TAG)
         expected_version = self._coordinator.next_submitted_version
@@ -207,7 +212,11 @@ class Zero2OwnerCpuUpdater:
             if self._native_staging_version != expected_version:
                 raise RuntimeError("Native owner gradient staging version changed before submission")
         self._native_dense_scales[expected_version] = dense_scale
-        version = self._coordinator.submit_boundary(self._flatten(second_by_group), self._flatten(dense_by_group))
+        # Freeze A's boundary LR before the scheduler advances; queued CPU jobs must never read a newer LR.
+        lr = self._native_hyperparameters[0] if lr is None else lr
+        version = self._coordinator.submit_boundary(self._flatten(second_by_group),
+                                                    self._flatten(dense_by_group),
+                                                    lr=lr)
         self._metadata[version] = (self._metadata_only(second_by_group), self._metadata_only(dense_by_group),
                                    dict(second_columns), dict(dense_columns))
         self._native_dense_staged = False
@@ -379,7 +388,7 @@ class Zero2OwnerCpuUpdater:
             dense_scale = self._native_dense_scales.pop(job.version, 1.0)
             if dense_scale != 1.0:
                 flat_gradient.narrow(0, second_numel, flat_gradient.numel() - second_numel).div_(dense_scale)
-            return self._native_step(flat_gradient, job.version)
+            return self._native_step(flat_gradient, job.version, job.lr)
         gradients = {
             (parameter_id, self._SECOND_TAG): gradient
             for parameter_id, gradient in job.second_gradients.items()
@@ -392,9 +401,52 @@ class Zero2OwnerCpuUpdater:
         if self._native_parameter is not None:
             raise RuntimeError("Native owner CPU gradients must use the flat transfer path")
         return {
-            self._result_key(parameter_id, tag): self._step(parameter_id, tag, gradient)
+            self._result_key(parameter_id, tag): self._step(parameter_id, tag, gradient, job.lr)
             for (parameter_id, tag), gradient in gradients.items()
         }
+
+    def _register_transfer_buffers(self, buffers: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+        cudart = torch.cuda.cudart()  #ignore-cuda
+        registered_buffers = []
+        try:
+            for buffer in buffers:
+                status = cudart.cudaHostRegister(buffer.data_ptr(), buffer.nbytes, 0)
+                if int(status) == 1:  # cudaErrorInvalidValue is not exposed by every PyTorch cudart binding.
+                    # Do not disguise a preceding asynchronous CUDA failure as a registration failure.
+                    get_accelerator().synchronize()
+                    get_last_error = getattr(cudart, "cudaGetLastError", None)
+                    if get_last_error is None:
+                        # Resolve PyTorch's own CUDA runtime; older bindings omit this entry point.
+                        get_last_error = ctypes.CDLL(torch._C.__file__).cudaGetLastError
+                        get_last_error.argtypes = []
+                        get_last_error.restype = ctypes.c_int
+                    # A successful retry does not clear the failed registration's thread-local error. Leaving it
+                    # pending makes a later, unrelated kernel fail its launch check with "invalid argument".
+                    last_error = int(get_last_error())
+                    if last_error not in (0, 1):
+                        raise RuntimeError(
+                            f"Unexpected CUDA error after owner CPU host registration: code={last_error}")
+                    warnings.warn(
+                        f"Owner CPU host registration returned invalid value; retrying once with fresh shared storage: "
+                        f"slot={len(registered_buffers)}, bytes={buffer.nbytes}, address={buffer.data_ptr():#x}",
+                        RuntimeWarning)
+                    if self._metrics is not None:
+                        self._metrics.increment("takeover_host_register_retry_count")
+                    # Keep the failed mapping alive until replacement allocation, preventing immediate address reuse.
+                    # Register the whole replacement: a DMA copy must not span separate registrations.
+                    replacement = torch.empty_like(buffer).share_memory_()
+                    status = cudart.cudaHostRegister(replacement.data_ptr(), replacement.nbytes, 0)
+                    buffer = replacement
+                if status != cudart.cudaError.success:
+                    raise RuntimeError(f"Failed to register owner CPU transfer buffer: {status}, code={int(status)}, "
+                                       f"slot={len(registered_buffers)}, bytes={buffer.nbytes}, "
+                                       f"address={buffer.data_ptr():#x}")
+                registered_buffers.append(buffer)
+        except Exception:
+            for registered in registered_buffers:
+                cudart.cudaHostUnregister(registered.data_ptr())
+            raise
+        return tuple(registered_buffers)
 
     def _initialize_native_optimizer(self, keys: list[tuple[int, int]]) -> None:
         from multiprocessing import get_context
@@ -409,15 +461,9 @@ class Zero2OwnerCpuUpdater:
             for _ in range(self._max_async_lag))
         fp32_gradient = torch.empty_like(master).share_memory_()
         return_parameters = (torch.empty(master.numel(), dtype=transfer_dtype, device="cpu").share_memory_(), )
-        cudart = torch.cuda.cudart()  #ignore-cuda
-        registered_buffers = []
-        for buffer in gradients + return_parameters:
-            status = cudart.cudaHostRegister(buffer.data_ptr(), buffer.nbytes, 0)
-            if status != cudart.cudaError.success:
-                for registered in registered_buffers:
-                    cudart.cudaHostUnregister(registered.data_ptr())
-                raise RuntimeError(f"Failed to register owner CPU transfer buffer: {status}")
-            registered_buffers.append(buffer)
+        registered_buffers = self._register_transfer_buffers(gradients + return_parameters)
+        gradients = registered_buffers[:self._max_async_lag]
+        return_parameters = registered_buffers[self._max_async_lag:]
         from deepspeed.utils.pin_memory_tracker import track_pinned_memory
         track_pinned_memory(sum(buffer.nbytes for buffer in registered_buffers))
         self._native_parameter = torch.nn.Parameter(master, requires_grad=False)
@@ -452,7 +498,7 @@ class Zero2OwnerCpuUpdater:
         self._native_command_queue = command_queue
         self._native_result_queue = result_queue
 
-    def _native_step(self, flat_gradient: torch.Tensor, version: int):
+    def _native_step(self, flat_gradient: torch.Tensor, version: int, lr: float):
         if self._native_parameter is None or self._native_process is None:
             raise RuntimeError("Native owner CPU optimizer state was not initialized")
         slot = self._native_slot(version)
@@ -466,7 +512,7 @@ class Zero2OwnerCpuUpdater:
         if self._return_visibility_event is not None:
             self._return_visibility_event.synchronize()
             self._return_visibility_event = None
-        self._native_command_queue.put(("step", slot))
+        self._native_command_queue.put(("step", slot, lr))
         step = self._native_result_queue.get()
         self._optimizer.set_state_steps(self._native_keys, step)
         result_values = self._native_return_parameters[0]
@@ -478,13 +524,13 @@ class Zero2OwnerCpuUpdater:
         self._native_parameter.grad = None
         return updated
 
-    def _step(self, parameter_id: int, tag: int, gradient: torch.Tensor) -> torch.Tensor:
+    def _step(self, parameter_id: int, tag: int, gradient: torch.Tensor, lr: float) -> torch.Tensor:
         key = (parameter_id, tag)
         try:
             values = self._optimizer.master_values(key)
         except KeyError as error:
             raise RuntimeError(f"Owner CPU optimizer state is unavailable for parameter {parameter_id}") from error
-        return self._optimizer.step_values(key, values, gradient)
+        return self._optimizer.step_values(key, values, gradient, lr=lr)
 
     def _commit(self, result: HybridUpdateResult) -> None:
         metadata = self._metadata.pop(result.version, None)

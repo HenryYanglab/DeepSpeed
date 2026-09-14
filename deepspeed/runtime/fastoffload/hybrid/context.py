@@ -18,6 +18,7 @@ class HybridUpdateJob:
     second_gradients: Mapping[int, torch.Tensor]
     dense_gradients: Mapping[int, torch.Tensor]
     transfer_event: Optional[Any] = None
+    lr: Optional[float] = None
 
 
 @dataclass(frozen=True)

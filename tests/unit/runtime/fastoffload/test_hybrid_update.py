@@ -2,6 +2,8 @@
 # DeepSpeed Team
 
 import threading
+import warnings
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -325,6 +327,27 @@ def test_compressed_microbatch_accumulator_handles_gas_and_unused_parameters():
     assert accumulator.micro_steps == 0
 
 
+@pytest.mark.parametrize("reduction", ["sum", "mean"])
+def test_compressed_gas_one_transfers_storage_without_copy(reduction):
+    accumulator = CompressedMicrobatchAccumulator(1, reduction)
+    source = torch.tensor([2.0, 4.0])
+    assert accumulator.accumulate({1: source}, take_ownership=True)
+    boundary = accumulator.take_boundary()
+    assert boundary[1].data_ptr() == source.data_ptr()
+    assert torch.equal(boundary[1], torch.tensor([2.0, 4.0]))
+    assert accumulator.micro_steps == 0
+    accumulator.discard()
+    assert torch.equal(boundary[1], source)
+
+
+def test_compressed_accumulator_default_preserves_caller_storage():
+    accumulator = CompressedMicrobatchAccumulator(1)
+    source = torch.tensor([2.0])
+    accumulator.accumulate({1: source})
+    source.zero_()
+    assert torch.equal(accumulator.take_boundary()[1], torch.tensor([2.0]))
+
+
 def test_takeover_pipeline_routes_gas_selected_and_dense_boundary_gradients():
     matrix = torch.nn.Parameter(torch.zeros((2, 3)))
     bias = torch.nn.Parameter(torch.zeros(2))
@@ -386,7 +409,8 @@ def test_takeover_pipeline_routes_gas_selected_and_dense_boundary_gradients():
     assert torch.equal(batch.dense[0].values[2], torch.full((2, ), 12.0))
 
 
-def test_takeover_runtime_updates_first_each_step_and_cpu_groups_at_boundary():
+@pytest.mark.parametrize("runtime_mode", ["hybrid", "gpu_ceiling", "gpu_ceiling_native_boundary"])
+def test_takeover_runtime_updates_first_each_step_and_cpu_groups_at_boundary(runtime_mode, monkeypatch):
     parameter = torch.nn.Parameter(torch.ones((2, 3)))
     fp32_partition = parameter.detach().view(-1).clone()
     layout = ParameterPartitionLayout(1, 0, (2, 3), 0, 6, 1)
@@ -435,6 +459,10 @@ def test_takeover_runtime_updates_first_each_step_and_cpu_groups_at_boundary():
             return 0, zeros, zeros
 
         @staticmethod
+        def get_learning_rate():
+            return 0.1
+
+        @staticmethod
         def get_fp32_partition(_group_id):
             return fp32_partition
 
@@ -454,10 +482,24 @@ def test_takeover_runtime_updates_first_each_step_and_cpu_groups_at_boundary():
         def all_ranks_ready(ready):
             return ready
 
-    runtime = Zero2TakeoverRuntime(Adapter(), registry, 2, 1, "cpu", "mean", 0.1, (0.0, 0.0), 1e-8, 0.0)
+    runtime_type = Zero2TakeoverRuntime
+    if runtime_mode != "hybrid":
+        from deepspeed.runtime.fastoffload.scripts.benchmark_gpu_ceiling import GpuCeilingTakeoverRuntime
+        runtime_type = GpuCeilingTakeoverRuntime
+    if runtime_mode == "gpu_ceiling_native_boundary":
+        Adapter.compute_native_gradient_numerics = staticmethod(lambda *_: (False, 6**0.5, 1.0))
+        Adapter.copy_local_reduced_gradient = staticmethod(lambda *_: None)
+        Adapter.get_local_reduced_gradient = staticmethod(lambda _: parameter.grad.view(-1))
+        Adapter.get_parameter = staticmethod(lambda _: parameter)
+        monkeypatch.setattr(get_accelerator(), "synchronize", lambda: None)
+
+    runtime = runtime_type(Adapter(), registry, 2, 1, "cpu", "mean", 0.1, (0.0, 0.0), 1e-8, 0.0)
     for step in range(2):
         parameter.grad = torch.ones_like(parameter)
-        assert runtime.capture_gradient(parameter, 0)
+        if runtime.native_dense_boundary:
+            assert runtime.capture_native_reduced_gradient(parameter)
+        else:
+            assert runtime.capture_gradient(parameter, 0)
         batch = runtime.finish_microbatch()
         assert batch is not None
         result = runtime.step(batch, loss_scale=1.0, clip_grad=0.0)
@@ -469,10 +511,22 @@ def test_takeover_runtime_updates_first_each_step_and_cpu_groups_at_boundary():
     runtime.close()
 
     assert torch.allclose(parameter[:, 0], torch.full((2, ), 0.8))
-    assert torch.allclose(parameter[:, 1:], torch.full((2, 2), 0.9))
+    if runtime_mode == "hybrid":
+        assert torch.allclose(parameter[:, 1:], torch.full((2, 2), 0.9))
+    else:
+        assert torch.equal(parameter[:, 1:], torch.ones((2, 2)))
+        runtime.assert_no_cpu_work()
+        assert runtime.counts["a_update_steps"] == 2
+        assert runtime.counts["dense_steps"] == 1
+        assert runtime.counts["ordinary_steps"] == 1
+        with pytest.raises(RuntimeError, match="GPU ceiling"):
+            runtime._cpu_updater.submit_boundary({}, {}, {}, {})
+        with pytest.raises(RuntimeError, match="checkpoints"):
+            runtime.state_dict()
 
 
-def test_owner_cpu_updater_accumulates_second_and_commits_dense_values():
+@pytest.mark.parametrize("rates", [(None, None), (0.07, 0.02), (0.07, 0.0)])
+def test_owner_cpu_updater_accumulates_second_and_commits_dense_values(rates):
     parameter = torch.ones((2, 3))
     fp32_partition = parameter.view(-1).clone()
     layout = ParameterPartitionLayout(1, 0, (2, 3), 0, 6, 1)
@@ -510,21 +564,121 @@ def test_owner_cpu_updater_accumulates_second_and_commits_dense_values():
         def all_ranks_ready(ready):
             return ready
 
-    updater = Zero2OwnerCpuUpdater(Adapter(), [layout], {0: collective}, 2, "cpu", "mean", 0.1, (0.0, 0.0), 1e-8, 0.0)
-    updater.accumulate_second(reduce(second_columns, 1.0))
-    updater.submit_boundary(reduce(second_columns, 3.0), reduce(dense_columns, 2.0), second_columns, dense_columns)
+    updater = Zero2OwnerCpuUpdater(Adapter(), [layout], {0: collective},
+                                   2,
+                                   "cpu",
+                                   "mean",
+                                   0.1, (0.0, 0.0),
+                                   1e-8,
+                                   0.0,
+                                   max_async_lag=2)
+    started, release = threading.Event(), threading.Event()
+    seen_lrs = []
 
-    checkpoint = updater.state_dict()
-    assert checkpoint["committed_version"] == 1
-    assert updater.pending_updates == 0
-    updater.close()
+    def blocked_update(job):
+        if job.version == 1:
+            started.set()
+            assert release.wait(timeout=20)
+        seen_lrs.append(job.lr)
+        return updater._update(job)
 
+    updater._coordinator._update_function = blocked_update
+    try:
+        for version, rate in enumerate(rates, 1):
+            lr = None if rate is None else torch.tensor(rate, dtype=torch.float64)
+            updater.accumulate_second(reduce(second_columns, 1.0))
+            updater.submit_boundary(reduce(second_columns, 3.0),
+                                    reduce(dense_columns, 2.0),
+                                    second_columns,
+                                    dense_columns,
+                                    lr=lr)
+            if lr is not None:
+                lr.fill_(0.9)
+            if version == 1:
+                assert started.wait(timeout=20)
+        assert updater.pending_updates == 2
+        release.set()
+        checkpoint = updater.state_dict()
+        assert checkpoint["committed_version"] == 2
+        assert updater.pending_updates == 0
+    finally:
+        release.set()
+        updater.close()
+
+    expected_lrs = [0.1 if rate is None else rate for rate in rates]
+    assert seen_lrs == expected_lrs
     assert torch.equal(parameter[:, 0], torch.ones(2))
-    assert torch.allclose(parameter[:, 1:], torch.full((2, 2), 0.9))
+    assert torch.allclose(parameter[:, 1:], torch.full((2, 2), 1.0 - sum(expected_lrs)))
     assert torch.equal(fp32_partition[[1, 2, 4, 5]], torch.ones(4))
 
 
-def test_owner_gpu_updater_updates_and_publishes_first_columns():
+@pytest.mark.parametrize("codes,error,sync_error,last_error", [
+    ((0, 0), None, False, 0),
+    ((1, 0, 0), None, False, 1),
+    ((0, 1, 0), None, False, 0),
+    ((0, 1, 1), "code=1", False, 1),
+    ((0, 2), "code=2", False, 0),
+    ((0, 1), "earlier async failure", True, 1),
+    ((0, 1), "Unexpected CUDA error", False, 700),
+])
+def test_owner_host_registration_retry_and_rollback(monkeypatch, codes, error, sync_error, last_error):
+    calls = []
+    unregistered = []
+    synchronized = []
+
+    def register(address, nbytes, flags):
+        calls.append((address, nbytes, flags))
+        return codes[len(calls) - 1]
+
+    def unregister(address):
+        unregistered.append(address)
+        return 0
+
+    def synchronize():
+        synchronized.append(True)
+        if sync_error:
+            raise RuntimeError("earlier async failure")
+
+    cudart = SimpleNamespace(cudaError=SimpleNamespace(success=0),
+                             cudaHostRegister=register,
+                             cudaHostUnregister=unregister,
+                             cudaGetLastError=lambda: last_error)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)  #ignore-cuda
+    monkeypatch.setattr(get_accelerator(), "synchronize", synchronize)
+    metrics = MetricsRegistry()
+    updater = Zero2OwnerCpuUpdater(None, [], {}, 2, "cpu", "mean", 0.1, (0.9, 0.999), 1e-8, 0.0, metrics=metrics)
+    buffers = tuple(torch.empty(8, dtype=torch.bfloat16).share_memory_() for _ in range(2))
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        if error is not None:
+            with pytest.raises(RuntimeError, match=error):
+                updater._register_transfer_buffers(buffers)
+            assert unregistered == [buffers[0].data_ptr()]
+        else:
+            registered = updater._register_transfer_buffers(buffers)
+            assert len(registered) == 2
+            assert unregistered == []
+            failed_addresses = {call[0] for code, call in zip(codes, calls) if code != 0}
+            for index, buffer in enumerate(registered):
+                replaced = buffers[index].data_ptr() in failed_addresses
+                assert (buffer.data_ptr() != buffers[index].data_ptr()) == replaced
+                assert buffer.is_shared()
+                assert buffer.dtype == buffers[index].dtype
+                assert buffer.numel() == buffers[index].numel()
+            updater._native_registered_buffers = registered
+    retries = int(1 in codes and not sync_error and last_error in (0, 1))
+    assert len(recorded) == retries
+    assert metrics.snapshot().counters.get("takeover_host_register_retry_count", 0) == retries
+    assert len(synchronized) == int(1 in codes)
+    assert len(calls) == len(codes)
+    assert all(nbytes == buffers[0].nbytes and flags == 0 for _, nbytes, flags in calls)
+    updater.close()
+    if error is None:
+        assert unregistered == [buffer.data_ptr() for buffer in registered]
+
+
+@pytest.mark.parametrize("lr", [None, 0.02, 0.0])
+def test_owner_gpu_updater_updates_and_publishes_first_columns(lr):
     parameter = torch.ones((2, 2))
     fp32_partition = parameter.view(-1).clone()
     layout = ParameterPartitionLayout(1, 0, (2, 2), 0, 4, 1)
@@ -559,10 +713,11 @@ def test_owner_gpu_updater_updates_and_publishes_first_columns():
     zeros = torch.zeros_like(fp32_partition)
     updater.initialize_state(1, columns[1], 0, zeros, zeros, torch.device("cpu"))
 
-    updated = updater.step({0: reduced}, columns)
+    updated = updater.step({0: reduced}, columns, lr=lr)
 
     assert updated == 2
-    assert torch.allclose(parameter[:, 0], torch.full((2, ), 0.9))
+    expected_lr = 0.1 if lr is None else lr
+    assert torch.allclose(parameter[:, 0], torch.full((2, ), 1.0 - expected_lr))
     assert torch.equal(parameter[:, 1], torch.ones(2))
     assert torch.equal(fp32_partition[[0, 2]], torch.ones(2))
 
@@ -751,6 +906,7 @@ def test_hybrid_coordinator_waits_for_transfer_in_worker_only():
 
     def update(job):
         assert transfer_complete.is_set()
+        assert job.lr == 0.0
         return {1: job.second_gradients[1]}
 
     coordinator = HybridUpdateCoordinator(update_interval=2,
@@ -758,7 +914,7 @@ def test_hybrid_coordinator_waits_for_transfer_in_worker_only():
                                           update_function=update,
                                           prepare_function=prepare)
     coordinator.accumulate_second({1: torch.tensor([1.0])})
-    coordinator.submit_boundary({1: torch.tensor([1.0])}, {})
+    coordinator.submit_boundary({1: torch.tensor([1.0])}, {}, lr=0.0)
     coordinator.wait_and_commit_oldest(lambda _result: None)
     coordinator.close()
 
@@ -908,3 +1064,39 @@ def test_selected_column_adam_updates_only_requested_columns():
     assert torch.equal(parameter[:, [0, 2]], original[:, [0, 2]])
     assert torch.allclose(parameter[:, [1, 3]], torch.full((2, 2), 0.9))
     assert optimizer.state_step("weight.first") == 1
+
+
+def test_selected_adam_per_step_lr_matches_torch_adamw():
+    values = torch.tensor([1.0, -2.0, 0.5])
+    reference = torch.nn.Parameter(values.clone())
+    expected = torch.optim.AdamW([reference], lr=0.5, betas=(0.8, 0.9), eps=1e-6, weight_decay=0.2)
+    selected = SelectedColumnAdamW(lr=0.5, betas=(0.8, 0.9), eps=1e-6, weight_decay=0.2)
+    for step, lr in enumerate((0.1, 0.025, 0.0, 0.075), 1):
+        gradient = torch.tensor([0.2 * step, -0.3, 0.1 / step])
+        reference.grad = gradient.clone()
+        expected.param_groups[0]["lr"] = lr
+        expected.step()
+        values = selected.step_values("a", values, gradient, lr=lr)
+        torch.testing.assert_close(values, reference)
+        master, first, second, actual_step = selected.state_tensors("a")
+        torch.testing.assert_close(master, reference)
+        torch.testing.assert_close(first, expected.state[reference]["exp_avg"])
+        torch.testing.assert_close(second, expected.state[reference]["exp_avg_sq"])
+        assert actual_step == step
+
+
+@pytest.mark.parametrize("lr", [-0.1, float("nan"), float("inf")])
+def test_invalid_lr_does_not_advance_adam_or_freeze_b(lr):
+    optimizer = SelectedColumnAdamW(lr=0.1)
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        optimizer.step_values("a", torch.ones(1), torch.ones(1), lr=lr)
+    assert optimizer.state_step("a") == 0
+    coordinator = HybridUpdateCoordinator(2, "cpu", lambda job: {})
+    try:
+        coordinator.accumulate_second({1: torch.ones(1)})
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            coordinator.submit_boundary({1: torch.ones(1)}, {}, lr=lr)
+        assert coordinator.active_accumulated_steps == 1
+        assert coordinator.next_submitted_version == 1 and coordinator.pending_updates == 0
+    finally:
+        coordinator.close()

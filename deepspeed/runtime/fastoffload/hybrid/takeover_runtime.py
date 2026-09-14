@@ -147,13 +147,17 @@ class Zero2TakeoverRuntime:
             self._pipeline.complete_step(overflow=True)
             return TakeoverStepResult(numerics, 0, None)
 
-        first_updated = self._gpu_updater.step(batch.first, batch.first_columns)
+        lr = self._adapter.get_learning_rate()
+        first_updated = self._gpu_updater.step(batch.first, batch.first_columns, lr=lr)
         submitted_version = None
         if batch.dense_boundary:
             if self._cpu_updater.at_capacity:
                 self._cpu_updater.wait_and_commit_oldest()
-            submitted_version = self._cpu_updater.submit_boundary(batch.second, batch.dense, batch.second_columns,
-                                                                  batch.dense_columns)
+            submitted_version = self._cpu_updater.submit_boundary(batch.second,
+                                                                  batch.dense,
+                                                                  batch.second_columns,
+                                                                  batch.dense_columns,
+                                                                  lr=lr)
         else:
             self._cpu_updater.accumulate_second(batch.second)
         self._pipeline.complete_step(overflow=False)
@@ -193,7 +197,8 @@ class Zero2TakeoverRuntime:
                     group_columns, group_values, self._compressed_bucket_bytes)
             reduced_bands.append(reduced_by_group)
 
-        first_updated = self._gpu_updater.step(reduced_bands[0], self._native_columns[0])
+        lr = self._adapter.get_learning_rate()
+        first_updated = self._gpu_updater.step(reduced_bands[0], self._native_columns[0], lr=lr)
         # The next forward may issue readiness collectives on a different ZeRO path. Finish the boundary publication
         # before allowing ranks with different host-side speeds to enter that collective sequence.
         get_accelerator().synchronize()
@@ -203,7 +208,8 @@ class Zero2TakeoverRuntime:
                                                               reduced_bands[2],
                                                               self._native_columns[1],
                                                               self._native_columns[2],
-                                                              dense_scale=combined_scale)
+                                                              dense_scale=combined_scale,
+                                                              lr=lr)
         self._clear_native_capture()
         self._pipeline.complete_step(overflow=False)
         return TakeoverStepResult(numerics, first_updated, submitted_version)
