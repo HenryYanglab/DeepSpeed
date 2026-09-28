@@ -964,6 +964,44 @@ class TestCompressedGradientCollective(DistributedTest):
         gathered = collective.all_gather({1: gradient.columns}, reduced)
         assert torch.equal(gathered[0].values, torch.tensor([[10.0, 11.0], [20.0, 21.0]], device=device))
 
+    def test_cpu_owner_reduce_scatter_with_uneven_and_empty_owners(self):
+        group = dist.new_group([0, 1], backend="gloo")
+        try:
+            rank = dist.get_rank()
+            partitions = [
+                ParameterPartitionLayout(1, 0, (2, 4), 0, 8, 2),
+                ParameterPartitionLayout(2, 0, (2, 4), 8, 8, 2)
+            ]
+            collective = Zero2OwnerCollective(partitions, group)
+            columns = {1: torch.tensor([1, 3]), 2: torch.tensor([2])}
+            gradients = [
+                CompressedColumnGradient(pid, cols, torch.full((2, cols.numel()), float(rank + pid)))
+                for pid, cols in columns.items()
+            ]
+            reduced = collective.reduce_scatter_buckets(gradients, bucket_bytes=4)
+            assert reduced.bucket_count == 2
+            for partition in partitions:
+                values = reduced.values[partition.parameter_id]
+                count = partition.owner_counts(columns[partition.parameter_id])[rank]
+                assert values.device.type == "cpu" and values.numel() == count
+                assert torch.equal(values, torch.full((count, ), partition.parameter_id + 0.5))
+        finally:
+            dist.destroy_process_group(group)
+
+    def test_mixed_device_numerics_share_one_global_clip_scale(self):
+        device = get_accelerator().current_device_name()
+        first = torch.tensor([3.0], device=device)
+        second = torch.tensor([4.0], device="cpu")
+        result = HybridGradientNumerics.unscale_and_clip([first, second], 2.0, 1.0, communication_device=device)
+        assert result.global_norm == pytest.approx((50.0**0.5) / 2)
+        assert result.combined_scale == pytest.approx(50.0**0.5)
+        assert first.item() == pytest.approx(3.0 / (50.0**0.5))
+        assert second.item() == pytest.approx(4.0 / (50.0**0.5))
+        second.fill_(float("inf") if dist.get_rank() == 0 else 1.0)
+        before = first.clone()
+        result = HybridGradientNumerics.unscale_and_clip([first, second], 2.0, 1.0, communication_device=device)
+        assert result.overflow and torch.equal(first, before)
+
     def test_two_rank_average(self):
         rank = dist.get_rank()
         device = get_accelerator().current_device_name()
@@ -973,6 +1011,52 @@ class TestCompressedGradientCollective(DistributedTest):
         reduced = CompressedGradientCollective.all_reduce([layout.pack_first(dense_gradient)])
 
         assert torch.allclose(reduced[0].values, torch.full((2, 1), 1.5, device=device))
+
+
+def test_cpu_B_capture_masks_native_boundary_and_fills_unused_gradients():
+    parameter = torch.nn.Parameter(torch.ones(2, 4))
+    registry = ImportanceRegistry()
+    registry.add(
+        ColumnImportanceSelection(parameter_id=1,
+                                  parameter_name="weight",
+                                  shape=(2, 4),
+                                  first_indices=torch.tensor([0]),
+                                  second_indices=torch.tensor([1]),
+                                  first_min_score=1.0,
+                                  second_min_score=0.5,
+                                  algorithm="test"))
+    registry.finalize()
+    collective = Zero2OwnerCollective([ParameterPartitionLayout(1, 0, (2, 4), 0, 8, 1)])
+    adapter = SimpleNamespace(
+        create_owner_collectives=lambda: {0: collective},
+        iter_parameter_partition_layouts=lambda: [ParameterPartitionLayout(1, 0, (2, 4), 0, 8, 1)],
+        get_parameter_id=lambda p: 1,
+        get_gradient_tensor=lambda p: p.grad)
+    pipeline = Zero2TakeoverGradientPipeline(adapter, registry, 2, 1, cpu_second_collectives={0: collective})
+    parameter.grad = torch.arange(8, dtype=torch.float32).view(2, 4)
+    original = parameter.grad.clone()
+    pipeline.capture_native_local_second(parameter)
+    assert torch.equal(parameter.grad[:, [0, 2, 3]], original[:, [0, 2, 3]])
+    assert torch.count_nonzero(parameter.grad[:, 1]) == 0
+    batch = pipeline.finish_microbatch()
+    assert torch.equal(batch.second[0].values[1], original[:, 1])
+    batch = pipeline.finish_microbatch()
+    assert torch.equal(batch.second[0].values[1], torch.zeros(2))
+
+
+@pytest.mark.parametrize("accumulation_device,gas", [("gpu", 1), ("cpu", 2)])
+def test_cpu_B_rejects_incompatible_accumulation_before_creating_groups(accumulation_device, gas):
+    with pytest.raises(ValueError, match="CPU accumulation and GAS=1"):
+        Zero2TakeoverRuntime(None,
+                             None,
+                             2,
+                             gas,
+                             accumulation_device,
+                             "mean",
+                             0.1, (0.9, 0.99),
+                             1e-8,
+                             0.0,
+                             second_reduce_scatter_device="cpu")
 
 
 def test_hybrid_runtime_updates_bias_and_norm_parameters_only_at_boundary():

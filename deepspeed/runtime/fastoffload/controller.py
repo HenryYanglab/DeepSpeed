@@ -126,6 +126,7 @@ class FastOffloadController:
         if self._takeover_runtime is None or not self._takeover_runtime.active:
             return False
         if self._takeover_runtime.native_dense_boundary:
+            self._takeover_runtime.capture_native_local_second(parameter)
             return False
         handled = self._takeover_runtime.capture_gradient(parameter, group_id)
         if handled:

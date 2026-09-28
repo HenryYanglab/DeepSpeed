@@ -131,12 +131,11 @@ def create_zero2_controller(optimizer: Any) -> Controller:
         if len(hyperparameters) != 1:
             raise ValueError("ZeRO-2 takeover currently requires identical Adam hyperparameters across groups")
         lr, betas, eps, weight_decay = hyperparameters.pop()
-        takeover_runtime = Zero2TakeoverRuntime(adapter, importance_registry, hybrid_config.update_interval,
-                                                optimizer.gradient_accumulation_steps,
-                                                hybrid_config.accumulation_device,
-                                                hybrid_config.second_gradient_reduction, lr, betas, eps, weight_decay,
-                                                hybrid_config.max_async_lag, hybrid_config.compressed_bucket_bytes,
-                                                observer.metrics, hybrid_config.pt_reserved_cores_perc)
+        takeover_runtime = Zero2TakeoverRuntime(
+            adapter, importance_registry, hybrid_config.update_interval, optimizer.gradient_accumulation_steps,
+            hybrid_config.accumulation_device, hybrid_config.second_gradient_reduction, lr, betas, eps, weight_decay,
+            hybrid_config.max_async_lag, hybrid_config.compressed_bucket_bytes, observer.metrics,
+            hybrid_config.pt_reserved_cores_perc, hybrid_config.second_reduce_scatter_device)
     scheduler = None
     if handle.config.mode in (FastOffloadMode.sync_offload, FastOffloadMode.async_offload):
         if not handle.config.transfer.cpu_staging and not optimizer.cpu_offload_pin_memory:

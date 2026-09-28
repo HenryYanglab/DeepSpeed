@@ -34,6 +34,7 @@ class Zero2ObserverAdapter(ObserverAdapter):
         self._global_step = 0
         self._micro_step = 0
         self._bucket_id = 0
+        self._cpu_owner_group = None
 
     def create_backward_begin_context(self) -> StepContext:
         self._micro_step = max(int(self._optimizer.micro_step_id) + 1, 0)
@@ -263,6 +264,35 @@ class Zero2ObserverAdapter(ObserverAdapter):
             group_id: Zero2OwnerCollective(layouts, self._optimizer.real_dp_process_group[group_id])
             for group_id, layouts in layouts_by_group.items()
         }
+
+    def create_cpu_owner_collectives(self) -> dict[int, Zero2OwnerCollective]:
+        layouts_by_group = {}
+        for layout in self.iter_parameter_partition_layouts():
+            layouts_by_group.setdefault(layout.group_id, []).append(layout)
+        if dist.is_initialized():
+            ranks = list(range(dist.get_world_size()))
+            # All ranks must create this communicator in the same order. Subgroup/model-parallel routing needs
+            # a global group-creation plan; reject it rather than risking a collective-order deadlock.
+            for group in self._optimizer.real_dp_process_group:
+                members = ranks if group is None else [
+                    dist.get_global_rank(group, rank) for rank in range(dist.get_world_size(group))
+                ]
+                if members != ranks:
+                    raise ValueError("CPU B reduce-scatter currently requires a full-world data parallel group")
+            if self._cpu_owner_group is None:
+                self._cpu_owner_group = dist.new_group(ranks, backend="gloo")
+        return {
+            group_id: Zero2OwnerCollective(layouts, self._cpu_owner_group)
+            for group_id, layouts in sorted(layouts_by_group.items())
+        }
+
+    def get_cpu_owner_group(self):
+        return self._cpu_owner_group
+
+    def close_cpu_owner_group(self) -> None:
+        if self._cpu_owner_group is not None:
+            dist.destroy_process_group(self._cpu_owner_group)
+            self._cpu_owner_group = None
 
     def create_compressed_gradient_reducer(self) -> Zero2CompressedGradientReducer:
         process_groups = {

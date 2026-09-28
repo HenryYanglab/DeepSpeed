@@ -345,7 +345,7 @@ throughput：              168.72 padded tokens/s
 peak allocated memory：   30.74 GiB/rank
 ```
 
-完整环境见 [EXPERIMENT_ENVIRONMENT.md](EXPERIMENT_ENVIRONMENT.md)。完整 ZenFlow 单 epoch 对比仍应以对应实验结束后
+完整环境见 [EXPERIMENT_ENVIRONMENT.md](../configuration/EXPERIMENT_ENVIRONMENT.md)。完整 ZenFlow 单 epoch 对比仍应以对应实验结束后
 生成的最终 summary 为准。
 
 ## 15. 脚本和资产

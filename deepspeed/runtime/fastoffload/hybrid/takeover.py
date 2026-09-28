@@ -3,9 +3,11 @@
 """Compressed gradient capture and owner reduction for ZeRO-2 takeover."""
 
 from dataclasses import dataclass
-from typing import Dict, Mapping
+from typing import Dict, Mapping, Optional
 
 import torch
+
+from deepspeed.accelerator import get_accelerator
 
 from .layout import CompressedColumnGradient, HybridColumnLayout
 from .microbatch import CompressedMicrobatchAccumulator
@@ -33,7 +35,8 @@ class Zero2TakeoverGradientPipeline:
                  update_interval: int,
                  gradient_accumulation_steps: int,
                  compressed_bucket_bytes: int = 134217728,
-                 metrics=None) -> None:
+                 metrics=None,
+                 cpu_second_collectives: Optional[Mapping] = None) -> None:
         self._adapter = adapter
         self._registry = importance_registry
         if compressed_bucket_bytes < 1:
@@ -43,6 +46,8 @@ class Zero2TakeoverGradientPipeline:
         self._metrics = metrics
         self._bucket_peak_bytes = 0
         self._collectives = adapter.create_owner_collectives()
+        self._cpu_second_collectives = cpu_second_collectives
+        self._second_transfer_buffer = None
         self._layouts = {layout.parameter_id: layout for layout in adapter.iter_parameter_partition_layouts()}
         # DeepSpeed scales each microbatch loss by GAS before backward, so summation reproduces its native gradient.
         self._first_accumulator = CompressedMicrobatchAccumulator(gradient_accumulation_steps, reduction="sum")
@@ -90,7 +95,7 @@ class Zero2TakeoverGradientPipeline:
         self._first_columns[parameter_id] = first.columns
         self._second_columns[parameter_id] = second.columns
         self._micro_first[parameter_id] = first.values
-        self._micro_second[parameter_id] = second.values
+        self._micro_second[parameter_id] = self._stage_second(second.values)
         if self.dense_boundary:
             dense = column_layout.pack_dense_remainder(gradient)
             self._dense_columns[parameter_id] = dense.columns
@@ -135,7 +140,51 @@ class Zero2TakeoverGradientPipeline:
         self._accumulate_micro_gradient(self._micro_first, parameter_id,
                                         values.index_select(1, first_positions).detach())
         self._accumulate_micro_gradient(self._micro_second, parameter_id,
-                                        values.index_select(1, second_positions).detach())
+                                        self._stage_second(values.index_select(1, second_positions).detach()))
+
+    def capture_native_local_second(self, parameter) -> None:
+        if self._cpu_second_collectives is None:
+            return
+        parameter_id = self._adapter.get_parameter_id(parameter)
+        selection = self._registry.get(parameter_id)
+        if selection is None or selection.second_indices.numel() == 0:
+            return
+        gradient = self._adapter.get_gradient_tensor(parameter)
+        columns = selection.second_indices.to(device=gradient.device)
+        self._second_columns[parameter_id] = selection.second_indices
+        self._accumulate_micro_gradient(self._micro_second, parameter_id,
+                                        self._stage_second(gradient.index_select(1, columns)))
+        # Preserve Native's streamed A/C layout, but never send B gradient values through its GPU reduction.
+        # These zero positions are layout padding, not a compressed A/C-only payload optimization.
+        gradient.index_fill_(1, columns, 0)
+
+    def _stage_second(self, gradient: torch.Tensor) -> torch.Tensor:
+        if self._cpu_second_collectives is None:
+            return gradient
+        if gradient.device.type == "cpu":
+            return gradient.detach().float().clone()
+        flat = gradient.detach().reshape(-1)
+        result = torch.empty(flat.numel(), dtype=torch.float32, device="cpu")
+        chunk_numel = min(flat.numel(), max(1, self._compressed_bucket_bytes // 2))
+        if chunk_numel:
+            accelerator = get_accelerator()
+            if self._second_transfer_buffer is None or self._second_transfer_buffer.numel() < chunk_numel:
+                self._second_transfer_buffer = accelerator.pin_memory(
+                    torch.empty(chunk_numel, dtype=torch.bfloat16, device="cpu"))
+            for start in range(0, flat.numel(), chunk_numel):
+                length = min(chunk_numel, flat.numel() - start)
+                source = flat.narrow(0, start, length).to(dtype=torch.bfloat16)
+                staging = self._second_transfer_buffer.narrow(0, 0, length)
+                staging.copy_(source, non_blocking=True)
+                event = accelerator.Event()
+                event.record(accelerator.current_stream())
+                # Only this bounded copy is waited on. CPU accumulation must not read a DMA destination early,
+                # and the scratch buffer/source must remain owned until the copy completes.
+                event.synchronize()
+                result.narrow(0, start, length).copy_(staging)
+        if self._metrics is not None:
+            self._metrics.increment("takeover_cpu_B_d2h_bytes", flat.numel() * 2)
+        return result.view(gradient.shape)
 
     def finish_microbatch(self) -> TakeoverGradientBatch | None:
         first_boundary = self._first_accumulator.accumulate(self._micro_first, take_ownership=True)
@@ -149,7 +198,21 @@ class Zero2TakeoverGradientPipeline:
         if not first_boundary:
             return None
         first = self._reduce_band(self._first_accumulator.take_boundary(), self._first_columns)
-        second = self._reduce_band(self._second_accumulator.take_boundary(), self._second_columns)
+        second_values = self._second_accumulator.take_boundary()
+        if self._cpu_second_collectives is not None:
+            # Missing local B gradients still participate as zeros in the globally fixed parameter order.
+            for parameter_id, layout in sorted(self._layouts.items()):
+                selection = self._registry.get(parameter_id)
+                if selection is None or selection.second_indices.numel() == 0:
+                    continue
+                self._second_columns[parameter_id] = selection.second_indices
+                if parameter_id not in second_values:
+                    shape = (layout.shape[0], selection.second_indices.numel())
+                    second_values[parameter_id] = torch.zeros(shape, dtype=torch.float32, device="cpu")
+        second = self._reduce_band(second_values, self._second_columns, self._cpu_second_collectives)
+        if self._cpu_second_collectives is not None and self._metrics is not None:
+            self._metrics.increment("takeover_cpu_B_reduce_scatter_buckets",
+                                    sum(s.bucket_count for s in second.values()))
         dense = self._reduce_band(self._dense_accumulator.take_boundary(), self._dense_columns)
         return TakeoverGradientBatch(first=first,
                                      second=second,
@@ -186,6 +249,10 @@ class Zero2TakeoverGradientPipeline:
         self._micro_second.clear()
         self._micro_dense.clear()
 
+    def close(self) -> None:
+        self.discard_microbatches()
+        self._second_transfer_buffer = None
+
     @staticmethod
     def _accumulate_micro_gradient(destination: Dict[int, torch.Tensor], parameter_id: int,
                                    gradient: torch.Tensor) -> None:
@@ -197,14 +264,16 @@ class Zero2TakeoverGradientPipeline:
             raise ValueError(f"Packed gradient layout changed for parameter {parameter_id}")
         current.add_(gradient)
 
-    def _reduce_band(self, values: Mapping[int, torch.Tensor], columns: Mapping[int, torch.Tensor]):
+    def _reduce_band(self, values: Mapping[int, torch.Tensor], columns: Mapping[int, torch.Tensor], collectives=None):
+        if collectives is None:
+            collectives = self._collectives
         by_group: Dict[int, list[CompressedColumnGradient]] = {}
         for parameter_id, gradient in values.items():
             layout = self._layouts[parameter_id]
             compressed = CompressedColumnGradient(parameter_id, columns[parameter_id], gradient)
             by_group.setdefault(layout.group_id, []).append(compressed)
         reduced_by_group = {
-            group_id: self._collectives[group_id].reduce_scatter_buckets(gradients, self._compressed_bucket_bytes)
+            group_id: collectives[group_id].reduce_scatter_buckets(gradients, self._compressed_bucket_bytes)
             for group_id, gradients in sorted(by_group.items())
         }
         if self._metrics is not None:

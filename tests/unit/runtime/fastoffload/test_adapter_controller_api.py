@@ -51,6 +51,22 @@ class FakeZero2Optimizer:
         parameter.grad = None
 
 
+def test_cpu_owner_group_rejects_subgroups_before_collective_creation(monkeypatch):
+    from deepspeed.runtime.fastoffload.adapters import zero2
+    optimizer = FakeZero2Optimizer()
+    optimizer.real_dp_process_group = [object()]
+    communication = SimpleNamespace(is_initialized=lambda: True,
+                                    get_world_size=lambda group=None: 2 if group is None else 1,
+                                    get_rank=lambda group=None: 0,
+                                    get_global_rank=lambda group, rank: rank,
+                                    new_group=Mock())
+    monkeypatch.setattr(zero2, "dist", communication)
+    adapter = Zero2ObserverAdapter(optimizer)
+    with pytest.raises(ValueError, match="full-world data parallel group"):
+        adapter.create_cpu_owner_collectives()
+    communication.new_group.assert_not_called()
+
+
 def make_step_context(timestamp_ns=1):
     return StepContext(global_step=0,
                        micro_step=0,

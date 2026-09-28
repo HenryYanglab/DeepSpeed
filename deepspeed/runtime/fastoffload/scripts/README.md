@@ -22,6 +22,7 @@ scripts/
 ├── run_hybrid_shadow_validation.sh     # Native/Shadow 双 GPU 正确性验证
 ├── validate_hybrid_shadow.py           # loss 和 compressed telemetry 校验
 ├── fastoffload_hybrid_shadow.json      # Shadow 模式配置模板
+├── fastoffload_cpu_b.json              # Takeover：B在CPU归约与累积（GAS=1）
 ├── prepare_benchmark_config.py         # 生成 run-specific telemetry 配置
 ├── summarize_benchmarks.py             # 生成 CSV 和 Markdown 汇总
 ├── benchmark_selective_backward.py     # Qwen shape selected-dW GPU microbenchmark
@@ -29,6 +30,15 @@ scripts/
 ├── requirements.txt                    # 样例额外依赖
 └── README.md
 ```
+
+## CPU B归约与累积
+
+`fastoffload_cpu_b.json` 同时启用 `second_reduce_scatter_device=cpu` 和 `accumulation_device=cpu`。
+需配合GAS=1的ZeRO-2 CPU optimizer offload主配置，以及覆盖整个world的数据并行组。
+普通步和密集边界的真实B梯度都在CPU经Gloo Reduce-Scatter归约，再跨步累积；A/C仍在GPU归约。
+它不是Native全量更新，也不是Shadow。未开启新开关的现有配置不改变归约位置。
+首版B下传和CPU归约同步等待，CPUAdam仍异步；保留Native密集桶中的零B占位，不宣称密集通信量减少。
+详细流程、精度和Checkpoint限制见[配置说明](../docs/configuration/CONFIGURATION.md)的“B在CPU归约与累积”。
 
 ## 安装
 

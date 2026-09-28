@@ -10,6 +10,23 @@ from deepspeed.runtime.fastoffload.config import (FastOffloadConfig, FastOffload
                                                   TelemetryConfig, TelemetryRankMode)
 
 
+@pytest.mark.parametrize("device,takeover,enabled,valid", [("cpu", True, True, True), ("gpu", True, True, False),
+                                                           ("cpu", False, True, False), ("cpu", True, False, False)])
+def test_cpu_B_reduce_scatter_requires_cpu_takeover(device, takeover, enabled, valid):
+    values = dict(enabled=True,
+                  importance=dict(enabled=True),
+                  hybrid_update=dict(enabled=enabled,
+                                     zero2_takeover=takeover,
+                                     accumulation_device=device,
+                                     second_reduce_scatter_device="cpu"))
+    if valid:
+        assert FastOffloadConfig.from_dict(values).hybrid_update.second_reduce_scatter_device == "cpu"
+    else:
+        with pytest.raises(ValidationError, match="CPU B reduce-scatter"):
+            FastOffloadConfig.from_dict(values)
+    assert FastOffloadConfig().hybrid_update.second_reduce_scatter_device == "gpu"
+
+
 def test_default_config_is_disabled_observer():
     config = FastOffloadConfig()
 

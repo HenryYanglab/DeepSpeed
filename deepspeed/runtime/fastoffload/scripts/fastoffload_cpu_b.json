@@ -1,0 +1,23 @@
+{
+  "enabled": true,
+  "mode": "observe",
+  "zero_stage": 2,
+  "importance": {
+    "enabled": true,
+    "algorithm": "pretrained_delta_topk",
+    "warmup_steps": 1,
+    "topk_ratio": 0.1,
+    "sparse_backward": true,
+    "sparse_backward_min_tokens": 1
+  },
+  "hybrid_update": {
+    "enabled": true,
+    "zero2_takeover": true,
+    "update_interval": 4,
+    "accumulation_device": "cpu",
+    "second_reduce_scatter_device": "cpu",
+    "second_gradient_reduction": "mean",
+    "compressed_bucket_bytes": 134217728,
+    "max_async_lag": 2
+  }
+}

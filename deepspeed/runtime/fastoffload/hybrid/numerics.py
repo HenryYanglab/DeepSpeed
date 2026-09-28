@@ -25,7 +25,8 @@ class HybridGradientNumerics:
     def unscale_and_clip(gradients: Iterable[torch.Tensor],
                          loss_scale: float,
                          clip_grad: float,
-                         process_group=None) -> HybridNumericsResult:
+                         process_group=None,
+                         communication_device=None) -> HybridNumericsResult:
         tensors = tuple(gradients)
         if loss_scale <= 0.0:
             raise ValueError("loss_scale must be positive")
@@ -33,15 +34,24 @@ class HybridGradientNumerics:
             raise ValueError("clip_grad must not be negative")
         if not tensors:
             return HybridNumericsResult(False, 0.0, loss_scale)
-        device = tensors[0].device
+        device = torch.device(communication_device) if communication_device is not None else tensors[0].device
+        statistics = {}
+        for gradient in tensors:
+            if communication_device is None and gradient.device != device:
+                raise ValueError("Hybrid gradients must use one device for numerics")
+            if gradient.device not in statistics:
+                statistics[gradient.device] = (torch.zeros(1, dtype=torch.float32, device=gradient.device),
+                                               torch.zeros(1, dtype=torch.int32, device=gradient.device))
+            local_norm, local_overflow = statistics[gradient.device]
+            finite = torch.isfinite(gradient).all()
+            local_overflow.copy_(torch.maximum(local_overflow, (~finite).to(dtype=local_overflow.dtype).view(1)))
+            local_norm.add_(gradient.detach().float().square().sum())
         norm_squared = torch.zeros(1, dtype=torch.float32, device=device)
         overflow = torch.zeros(1, dtype=torch.int32, device=device)
-        for gradient in tensors:
-            if gradient.device != device:
-                raise ValueError("Hybrid gradients must use one device for numerics")
-            finite = torch.isfinite(gradient).all()
-            overflow.copy_(torch.maximum(overflow, (~finite).to(dtype=overflow.dtype).view(1)))
-            norm_squared.add_(gradient.detach().float().square().sum())
+        for local_norm, local_overflow in statistics.values():
+            # Only scalar statistics cross devices; CPU B gradients and accumulators never return to the GPU.
+            norm_squared.add_(local_norm.to(device=device))
+            overflow.copy_(torch.maximum(overflow, local_overflow.to(device=device)))
         if dist.is_initialized():
             dist.all_reduce(norm_squared, op=dist.ReduceOp.SUM, group=process_group)
             dist.all_reduce(overflow, op=dist.ReduceOp.MAX, group=process_group)

@@ -95,7 +95,8 @@ class DoubleBufferedGradientAccumulator:
     def load_active_state_dict(self, state_dict: dict) -> None:
         with self._lock:
             active = self._slots[self._active_id]
-            if active.state != HybridBufferState.accumulating or active.accumulated_steps or active.gradients:
+            # Reset slots retain zeroed allocations for reuse; those are not live accumulated gradients.
+            if active.state != HybridBufferState.accumulating or active.accumulated_steps:
                 raise RuntimeError("Active hybrid buffer must be empty before restore")
             steps = int(state_dict.get("accumulated_steps", 0))
             if steps < 0:

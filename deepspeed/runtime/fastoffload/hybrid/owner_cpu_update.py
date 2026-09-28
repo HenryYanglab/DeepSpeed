@@ -106,8 +106,10 @@ class Zero2OwnerCpuUpdater:
         self._second_gradient_reduction = second_gradient_reduction
         self._max_async_lag = max_async_lag
         self._pt_reserved_cores_perc = pt_reserved_cores_perc
-        self._transfer_stream = (get_accelerator().Stream()
-                                 if accumulation_device == "gpu" and get_accelerator().is_available() else None)
+        # C still arrives from the GPU and results still return there, even when B accumulates on the CPU.
+        accelerator = get_accelerator()
+        self._transfer_stream = (accelerator.Stream()
+                                 if accelerator.is_available() and accelerator.Stream is not None else None)
         self._metadata: Dict[int, tuple] = {}
         self._coordinator = HybridUpdateCoordinator(update_interval=update_interval,
                                                     accumulation_device=accumulation_device,

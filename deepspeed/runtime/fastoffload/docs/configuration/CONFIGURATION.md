@@ -138,7 +138,7 @@ config = FastOffloadConfig.from_dict({
 
 ## Hybrid sparse/dense update
 
-完整语义和状态机见 [HYBRID_UPDATE_DESIGN.md](HYBRID_UPDATE_DESIGN.md)。核心配置为：
+完整语义和状态机见 [HYBRID_UPDATE_DESIGN.md](../design/HYBRID_UPDATE_DESIGN.md)。核心配置为：
 
 ```json
 {
@@ -172,6 +172,42 @@ Takeover checkpoint 保存 importance layout、A/B/C optimizer state、successfu
 `compressed_bucket_bytes` 同时限制 Shadow 和 Takeover 待打包参数集合的目标大小。Takeover 按 parameter ID 确定性分桶，对每个桶独立执行 owner-padded reduce-scatter、更新和 all-gather，并在下一个桶前释放临时 packed tensor。单个参数不会被拆分，因此参数数据的目标上限是 `max(compressed_bucket_bytes, largest_compressed_parameter_bytes)`；owner padding 可能使实际 collective allocation 更高，实际值记录在 `takeover_owner_bucket_peak_bytes`。Shadow 归约结果在完成 native parity 和 owner partition 校验后立即释放，不再保留整模型 packed buffer。`parity_atol` 和 `parity_rtol` 控制 compressed/native、norm 和 owner-value 比对容差。
 
 Shadow 目前校验 owner-rank 对应元素的 compressed collective 数值、有限性/overflow 决策、L2 norm，以及 D2H 后 ZeRO FP32 flat partition 的 owner offset/value。尚未用压缩结果替换 ZeRO-2 optimizer step，因此该开关用于分布式正确性和通信量验证，而不是性能训练。
+
+## B在CPU归约与累积
+
+`hybrid_update.second_reduce_scatter_device` 可选 `gpu` / `cpu`，默认 `gpu`，不改变现有配置的归约位置。
+单独设置 `accumulation_device=cpu` 仍表示GPU归约后在CPU累积；要运行图示的CPU B路线，需要同时设置：
+
+```json
+{
+  "hybrid_update": {
+    "enabled": true,
+    "zero2_takeover": true,
+    "update_interval": 4,
+    "accumulation_device": "cpu",
+    "second_reduce_scatter_device": "cpu",
+    "second_gradient_reduction": "mean",
+    "max_async_lag": 2
+  }
+}
+```
+
+完整示例见 `scripts/fastoffload_cpu_b.json`。DeepSpeed主配置必须是ZeRO-2 CPU optimizer offload、GAS=1。
+当前仅支持覆盖整个world且rank顺序一致的数据并行组；model-parallel/子组布局和GAS>1明确报错，不回退到GPU。
+CPU通信使用独立Gloo group和真实CPU `reduce_scatter_tensor`，不是GPU归约，也不是全量all-reduce后本地切片。
+
+- 普通步：本地packed B经有界BF16 D2H暂存，转CPU FP32，CPU Reduce-Scatter平均到owner，再统一数值检查/裁剪，加入CPU FP32累积缓冲。
+- 密集边界：在Native GPU归约之前取出本地B并清零原梯度的B列；B仍走CPU归约，当前边界B加入累积。Native继续流式处理A/C及C的D2H，不新增全模型GPU梯度暂存。
+- Native密集桶仍保留B的零占位，未实现纯A/C压缩的密集通信布局。因此B梯度值不在GPU归约，但GPU密集通信字节不一定减少。
+- A/C和CPU B的FP32范数共同决定全局裁剪系数；只交换统计标量，不把CPU B梯度搬回GPU。溢出步不更新A、不加入当前B、不提交C、不推进成功步。
+- B累积和C边界梯度按原规则提交CPUAdam；大owner路径保留现有BF16版本梯度槽，再转换为FP32执行Adam，因此边界提交仍有一次BF16量化。不是与GPU归约模式逐位等价的精度消融。
+- C传输及B/C参数返回使用独立CUDA stream，不再由B累积位置决定是否创建stream。版本所属缓冲、LR、返回缓冲保护、按序发布和前向可见性规则不变。
+- 首版B D2H按参数内连续块传输，每块等待自己的完成事件后读取/复用暂存；Gloo B归约在训练rank主线程同步执行。CPUAdam仍可与后续训练重叠，但不声称B接收/归约已经形成完全异步通信流水线。
+- B D2H暂存目标不超过 `compressed_bucket_bytes`（最小一个BF16元素）。CPU归约仍按完整参数分桶，单参数和owner padding可能超过桶目标。
+- Checkpoint保存归约位置；恢复时不允许静默切换CPU/GPU B归约。部分周期CPU累积可保存/恢复；drain不为不足周期的B补C。
+
+观测计数：`takeover_cpu_B_d2h_bytes` 是当前rank实际BF16 B下传字节，`takeover_cpu_B_reduce_scatter_buckets` 是CPU归约桶数。
+这两个计数不代表传输带宽或峰值内存。已覆盖CPU及双GPU正确性测试；大模型显存/吞吐收益尚未测量，不复用原GPU累积实验结果。
 
 ## Takeover学习率scheduler
 

@@ -282,10 +282,14 @@ class TestZero2TakeoverTwoRanks(DistributedTest):
     world_size = 2
     non_daemonic_procs = True
 
-    @pytest.mark.parametrize("hidden_dim,register_failure,with_scheduler", [(8, False, False), (2048, False, False),
-                                                                            (2048, True, False), (8, False, True),
-                                                                            (2048, False, True)])
-    def test(self, hidden_dim, register_failure, with_scheduler):
+    @pytest.mark.parametrize("hidden_dim,register_failure,with_scheduler,second_device", [(8, False, False, "gpu"),
+                                                                                          (2048, False, False, "gpu"),
+                                                                                          (2048, True, False, "gpu"),
+                                                                                          (8, False, True, "gpu"),
+                                                                                          (2048, False, True, "gpu"),
+                                                                                          (8, False, True, "cpu"),
+                                                                                          (2048, False, True, "cpu")])
+    def test(self, hidden_dim, register_failure, with_scheduler, second_device):
         # The larger owner shard must exercise shared registration and the spawned CPUAdam process.
         torch.manual_seed(1234)
         model = SimpleModel(hidden_dim)
@@ -320,7 +324,9 @@ class TestZero2TakeoverTwoRanks(DistributedTest):
                 "enabled": True,
                 "update_interval": 2,
                 "zero2_takeover": True,
-                "compressed_bucket_bytes": 32,
+                "compressed_bucket_bytes": 65536 if second_device == "cpu" else 32,
+                "second_reduce_scatter_device": second_device,
+                "accumulation_device": "cpu",
                 "max_async_lag": 2,
             },
             "telemetry": {
@@ -344,6 +350,30 @@ class TestZero2TakeoverTwoRanks(DistributedTest):
                                                    lr_scheduler=make_scheduler if with_scheduler else None)
             runtime = engine.optimizer._fastoffload_controller._takeover_runtime
             updater = runtime._cpu_updater
+            cpu_reductions, masked_boundaries = [], []
+            if second_device == "cpu":
+                cpu_group = runtime._adapter.get_cpu_owner_group()
+                assert cpu_group.name() == "gloo"
+                reduce_scatter = dist.reduce_scatter_fn
+                mask_boundary = runtime._pipeline.capture_native_local_second
+
+                def audit_reduce(output, packed, group=None, **kwargs):
+                    if group is cpu_group:
+                        assert output.device.type == packed.device.type == "cpu"
+                        assert packed.dtype == torch.float32
+                        cpu_reductions.append(packed.numel())
+                    return reduce_scatter(output, packed, group=group, **kwargs)
+
+                def audit_mask(parameter):
+                    mask_boundary(parameter)
+                    selection = runtime._importance_registry.get(runtime._adapter.get_parameter_id(parameter))
+                    if selection is not None:
+                        columns = selection.second_indices.to(parameter.device)
+                        assert torch.count_nonzero(runtime._adapter.get_gradient_tensor(parameter)[:, columns]) == 0
+                        masked_boundaries.append(True)
+
+                patches.setattr(dist, "reduce_scatter_fn", audit_reduce)
+                patches.setattr(runtime._pipeline, "capture_native_local_second", audit_mask)
             if with_scheduler:
                 gpu_step = runtime._gpu_updater.step
                 cpu_update = updater._coordinator._update_function
@@ -412,6 +442,15 @@ class TestZero2TakeoverTwoRanks(DistributedTest):
                 assert torch.allclose(parameter, mean)
             runtime = engine.optimizer._fastoffload_controller._takeover_runtime
             retries = runtime._cpu_updater._metrics.snapshot().counters.get("takeover_host_register_retry_count", 0)
+            if second_device == "cpu":
+                assert cpu_reductions and masked_boundaries
+                buffer = runtime._pipeline._second_transfer_buffer
+                assert buffer.device.type == "cpu" and buffer.is_pinned() and buffer.nbytes <= 65536
+                accumulator = updater._coordinator.accumulator
+                assert accumulator.accumulation_device.type == "cpu"
+                for slot in accumulator._slots:
+                    assert all(value.device.type == "cpu" and value.dtype == torch.float32
+                               for value in slot.gradients.values())
         finally:
             try:
                 if engine is not None:
@@ -419,6 +458,8 @@ class TestZero2TakeoverTwoRanks(DistributedTest):
                 handle.close()
             finally:
                 patches.undo()
+        if second_device == "cpu":
+            assert runtime._adapter.get_cpu_owner_group() is None
         if with_scheduler:
             assert gpu_lrs == [1e-3 * factor for factor in factors[1:steps]]
             assert cpu_lrs == [1e-3 * factors[step - 1] for step in range(3, steps + 1, 2)]
@@ -435,7 +476,8 @@ class TestZero2TakeoverTwoRanks(DistributedTest):
             assert updater._native_gradients[0].dtype == next(engine.module.parameters()).dtype
             assert updater._native_return_parameters[0].dtype == updater._native_gradients[0].dtype
 
-    def test_overflow_and_checkpoint_drain(self):
+    @pytest.mark.parametrize("second_device", ["gpu", "cpu"])
+    def test_overflow_and_checkpoint_drain(self, second_device):
         hidden_dim = 8
         torch.manual_seed(1234)
         model = SimpleModel(hidden_dim)
@@ -480,6 +522,8 @@ class TestZero2TakeoverTwoRanks(DistributedTest):
                 "update_interval": 2,
                 "zero2_takeover": True,
                 "compressed_bucket_bytes": 32,
+                "second_reduce_scatter_device": second_device,
+                "accumulation_device": "cpu",
                 "max_async_lag": 2,
             },
             "telemetry": {
@@ -528,6 +572,48 @@ class TestZero2TakeoverTwoRanks(DistributedTest):
             assert runtime.pending_updates == 0
             for before, parameter in zip(parameters_before_overflow, engine.module.parameters()):
                 assert torch.equal(before, parameter)
+
+            if second_device == "cpu":
+                # Save/restore a partial CPU B interval, then overflow ONLY B at a dense boundary. GPU A/C
+                # remain finite, so the combined CPU/GPU overflow check must prevent both updates and scheduling.
+                loss = engine(inputs, labels)
+                engine.backward(loss)
+                engine.step()
+                assert runtime._pipeline._successful_steps == 3
+                partial = engine.optimizer._fastoffload_controller.hybrid_state_dict()
+                assert partial["cpu_updater"]["active_accumulator"]["accumulated_steps"] == 1
+                with pytest.raises(ValueError, match="Cannot change B reduce-scatter device"):
+                    runtime.load_state_dict(dict(partial, second_reduce_scatter_device="gpu"))
+                runtime._cpu_updater.discard_active_gradients()
+                engine.optimizer._fastoffload_controller.load_hybrid_state_dict(partial)
+                before_accumulator = clone_state(runtime._cpu_updater._coordinator.accumulator.active_state_dict())
+                before_parameters = [p.detach().clone() for p in engine.module.parameters()]
+                stage_second = runtime._pipeline._stage_second
+
+                def corrupt_cpu_B(gradient):
+                    result = stage_second(gradient)
+                    if dist.get_rank() == 0 and result.numel():
+                        result.view(-1)[0] = float("inf")
+                    return result
+
+                with pytest.MonkeyPatch.context() as patches:
+                    patches.setattr(runtime._pipeline, "_stage_second", corrupt_cpu_B)
+                    loss = engine(inputs, labels)
+                    engine.backward(loss)
+                    engine.step()
+                assert engine.optimizer.overflow
+                assert runtime._pipeline._successful_steps == 3 and runtime.pending_updates == 0
+                assert_state_equal(before_accumulator,
+                                   runtime._cpu_updater._coordinator.accumulator.active_state_dict())
+                for before, parameter in zip(before_parameters, engine.module.parameters()):
+                    assert torch.equal(before, parameter)
+                loss = engine(inputs, labels)
+                engine.backward(loss)
+                engine.step()
+                resumed = engine.optimizer._fastoffload_controller.hybrid_state_dict()
+                assert resumed["cpu_updater"]["committed_version"] == 2
+                assert runtime._pipeline._successful_steps == 4
+                assert resumed["cpu_updater"]["active_accumulator"]["accumulated_steps"] == 0
 
             for parameter in engine.module.parameters():
                 mean = parameter.detach().clone()

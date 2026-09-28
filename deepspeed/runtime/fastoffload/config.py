@@ -108,6 +108,7 @@ class HybridUpdateConfig(FastOffloadConfigModel):
     enabled: bool = False
     update_interval: int = Field(default=8, ge=2)
     accumulation_device: Literal["cpu", "gpu"] = "cpu"
+    second_reduce_scatter_device: Literal["cpu", "gpu"] = "gpu"
     dense_boundary_enabled: Literal[True] = True
     double_buffer: Literal[True] = True
     second_gradient_reduction: Literal["mean", "sum"] = "mean"
@@ -165,6 +166,11 @@ class FastOffloadConfig(FastOffloadConfigModel):
             raise ValueError("Hybrid update requires mode=observe")
         if self.hybrid_update.compressed_collective_shadow and self.hybrid_update.zero2_takeover:
             raise ValueError("Hybrid Shadow and ZeRO-2 takeover cannot be enabled together")
+        if self.hybrid_update.second_reduce_scatter_device == "cpu":
+            if not self.hybrid_update.enabled or not self.hybrid_update.zero2_takeover:
+                raise ValueError("CPU B reduce-scatter requires enabled ZeRO-2 takeover")
+            if self.hybrid_update.accumulation_device != "cpu":
+                raise ValueError("CPU B reduce-scatter requires CPU accumulation")
         if self.mode == FastOffloadMode.sync_offload:
             if self.scheduler.type != SchedulerType.synchronous or self.scheduler.max_inflight_tasks != 1:
                 raise ValueError("sync_offload requires the synchronous scheduler with max_inflight_tasks=1")

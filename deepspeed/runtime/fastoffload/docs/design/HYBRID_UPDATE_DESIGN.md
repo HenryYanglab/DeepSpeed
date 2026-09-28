@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- DeepSpeed Team -->
+
 # FastOffload Hybrid Sparse/Dense Update Design
 
 ## 1. Scope
@@ -86,6 +89,38 @@ GPU active_buffer[B] += gradient
 ```
 
 At a dense boundary, the frozen sum is copied to CPU once. This reduces D2H submissions but consumes GPU memory and creates a concentrated boundary transfer.
+
+### 3.3 Owner-local CPU B reduction (opt-in Takeover route)
+
+`second_reduce_scatter_device="cpu"` together with `accumulation_device="cpu"` implements the CPU route:
+
+```text
+local packed B on GPU
+  → bounded BF16 D2H scratch (wait for each copy before reuse)
+  → CPU FP32 gradients
+  → Gloo reduce-scatter to the existing ZeRO owners
+  → shared A/B/(C) global-norm and overflow decision
+  → CPU FP32 B accumulation, including the current boundary
+  → version-owned B/C CPUAdam submission and existing ordered publication
+```
+
+The default reduction device remains GPU; CPU accumulation alone does not select CPU communication.
+This first implementation requires GAS=1 and full-world data parallel groups. It creates a private Gloo group,
+uses actual CPU reduce-scatter, and destroys the group after draining updates at shutdown. Unsupported subgroup
+routing is rejected before creating a communicator. Missing local B entries contribute zeros in deterministic
+parameter/bucket order. No full gradient is copied back to GPU for norm computation: only scalar statistics move.
+
+At a Native dense boundary, local B is captured before GPU reduction and its columns are zeroed in Native's input.
+A/C continue through the existing streamed Native layout; C is staged directly into the version-owned CPU slot.
+The GPU payload still contains zero B positions, so this does not claim an A/C-only compressed dense payload.
+Native A/C norms and CPU B norms jointly determine one scale; B-only CPU overflow must invalidate the current
+step even though the GPU input is finite. Earlier valid B accumulation and submitted versions retain their semantics.
+
+CPU B D2H and Gloo reduction are synchronous in the training rank in this reference route; spawned CPUAdam remains
+asynchronous. CPU-resident accumulation does not disable the dedicated CUDA stream for C and return transfers.
+The existing large-owner BF16 submission slots are retained, including their boundary quantization before FP32 Adam.
+Checkpoints record the reduction device and reject cross-route restores; reset cached allocations do not prevent
+restoring a partial CPU accumulator. Throughput and real-model memory savings require separate measurements.
 
 ## 4. Double-buffer state machine
 
@@ -235,7 +270,7 @@ Not yet connected to the live ZeRO-2 path:
 - Dense-boundary switching for all parameter types.
 - Replacing the existing dense ZeRO gradient hooks with the implemented compressed collective and owner mapping.
 - Overflow/global norm/clipping collectives.
-- Stream/event-based pinned CPU accumulation and H2D commits.
+- Fully overlapped, batched B D2H/CPU-collective scheduling beyond the synchronous CPU B reference route.
 - Replacing the original `ZeroOptimizer.step()` with `HybridUpdateRuntime.step()`.
 
 Until these items pass distributed parity tests, `hybrid_update.enabled=true` intentionally raises during ZeRO controller creation rather than running with misleading dense semantics.

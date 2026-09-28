@@ -18,17 +18,23 @@ FastOffload 是面向 DeepSpeed ZeRO-Offload 的实验性扩展框架，目标�
 
 ## 文档
 
-- [当前实现状态与功能清单](IMPLEMENTATION_STATUS.md)
-- [总体架构设计](DESIGN.md)
-- [Hybrid sparse/dense update 设计](HYBRID_UPDATE_DESIGN.md)
-- [论文与当前实现差距分析](PAPER_IMPLEMENTATION_GAP_ANALYSIS.md)
-- [Overview 图绘制需求简述](OVERVIEW_FIGURE_BRIEF.md)
-- [Overview 图详细提示词与规范](OVERVIEW_FIGURE_PROMPT.md)
-- [实验软硬件环境与版本](EXPERIMENT_ENVIRONMENT.md)
-- [Observer 配置](CONFIGURATION.md)
+- [分类文档索引](docs/README.md)
+
+论文、图片、工作簿及原始实验输出不随本次代码与文档更新发布。
+
+- [FastOffload方法与实现详解（中文；A/B/C累积位置、dtype与完整生命周期）](docs/design/FASTOFFLOAD_METHODOLOGY_AND_IMPLEMENTATION_ZH.md)
+- [完整消融实验方案（中文；排除CPU累积与CPU归约）](docs/experiments/FASTOFFLOAD_ABLATION_EXPERIMENT_PLAN_ZH.md)
+- [当前实现状态与功能清单](docs/history/IMPLEMENTATION_STATUS.md)
+- [总体架构设计](docs/design/DESIGN.md)
+- [Hybrid sparse/dense update 设计](docs/design/HYBRID_UPDATE_DESIGN.md)
+- [论文与当前实现差距分析](docs/design/PAPER_IMPLEMENTATION_GAP_ANALYSIS.md)
+- [Overview 图绘制需求简述](docs/paper/OVERVIEW_FIGURE_BRIEF.md)
+- [Overview 图详细提示词与规范](docs/paper/OVERVIEW_FIGURE_PROMPT.md)
+- [实验软硬件环境与版本](docs/configuration/EXPERIMENT_ENVIRONMENT.md)
+- [Observer 配置](docs/configuration/CONFIGURATION.md)
 - [DeepSpeed 适配层](adapters/README.md)
 - [策略模块](policies/README.md)
-- [重要性选择配置](CONFIGURATION.md#column-importance-selection)
+- [重要性选择配置](docs/configuration/CONFIGURATION.md#column-importance-selection)
 - [调度模块](schedulers/README.md)
 - [传输模块](transfer/README.md)
 - [CPU Worker 模块](workers/README.md)
@@ -40,7 +46,7 @@ FastOffload 是面向 DeepSpeed ZeRO-Offload 的实验性扩展框架，目标�
 ```text
 fastoffload/
 ├── README.md
-├── DESIGN.md
+├── docs/                   # 设计、配置、实验、论文与历史文档
 ├── api.py                  # Observer 安装、卸载和 Null Controller
 ├── config.py               # 独立且不可变的配置模型
 ├── controller.py           # 生命周期协调与失败策略

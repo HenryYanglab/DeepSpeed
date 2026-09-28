@@ -41,7 +41,13 @@ class Zero2TakeoverRuntime:
                  max_async_lag: int = 1,
                  compressed_bucket_bytes: int = 134217728,
                  metrics=None,
-                 pt_reserved_cores_perc: float = 0.25) -> None:
+                 pt_reserved_cores_perc: float = 0.25,
+                 second_reduce_scatter_device: str = "gpu") -> None:
+        if second_reduce_scatter_device not in ("cpu", "gpu"):
+            raise ValueError("B reduce-scatter device must be cpu or gpu")
+        self._cpu_second = second_reduce_scatter_device == "cpu"
+        if self._cpu_second and (accumulation_device != "cpu" or gradient_accumulation_steps != 1):
+            raise ValueError("CPU B reduce-scatter requires CPU accumulation and GAS=1")
         layouts = tuple(adapter.iter_parameter_partition_layouts())
         collectives = adapter.create_owner_collectives()
         self._adapter = adapter
@@ -59,8 +65,10 @@ class Zero2TakeoverRuntime:
         self._native_transfer_event = None
         self._state_initialized = False
         self._selective_configured = False
+        cpu_collectives = adapter.create_cpu_owner_collectives() if self._cpu_second else None
         self._pipeline = Zero2TakeoverGradientPipeline(adapter, importance_registry, update_interval,
-                                                       gradient_accumulation_steps, compressed_bucket_bytes, metrics)
+                                                       gradient_accumulation_steps, compressed_bucket_bytes, metrics,
+                                                       cpu_collectives)
         self._gpu_updater = Zero2OwnerGpuUpdater(adapter, layouts, collectives, lr, betas, eps, weight_decay)
         self._cpu_updater = Zero2OwnerCpuUpdater(adapter, layouts, collectives, update_interval, accumulation_device,
                                                  second_gradient_reduction, lr, betas, eps, weight_decay,
@@ -77,6 +85,9 @@ class Zero2TakeoverRuntime:
     @property
     def native_dense_boundary(self) -> bool:
         return self._supports_native_boundary and self.active and self._pipeline.dense_boundary
+
+    def capture_native_local_second(self, parameter) -> None:
+        self._pipeline.capture_native_local_second(parameter)
 
     def capture_native_reduced_gradient(self, parameter) -> bool:
         if not self.native_dense_boundary:
@@ -98,6 +109,8 @@ class Zero2TakeoverRuntime:
                        torch.arange(layout.shape[1], dtype=torch.long)[mask])
         destinations = (self._native_first, self._native_second, self._native_dense)
         for band, parameter_columns in enumerate(columns):
+            if self._cpu_second and band == 1:
+                continue
             if parameter_columns is None or parameter_columns.numel() == 0:
                 continue
             values = layout.extract_fragment_values(fragment, parameter_columns, rank)
@@ -124,25 +137,27 @@ class Zero2TakeoverRuntime:
             return batch
         self._native_transfer_event = self._cpu_updater.record_native_transfer_event()
         return TakeoverGradientBatch(first={},
-                                     second={},
+                                     second=batch.second,
                                      dense={},
                                      first_columns={},
-                                     second_columns={},
+                                     second_columns=batch.second_columns,
                                      dense_columns={},
                                      dense_boundary=True,
                                      native_boundary=True)
 
     def step(self, batch: TakeoverGradientBatch, loss_scale: float, clip_grad: float) -> TakeoverStepResult:
         if batch.native_boundary:
-            return self._native_boundary_step(loss_scale, clip_grad)
+            return self._native_boundary_step(loss_scale, clip_grad, batch)
         gradients = []
         for reduced_by_group in (batch.first, batch.second, batch.dense):
             for reduced in reduced_by_group.values():
                 gradients.extend(reduced.values.values())
-        numerics = HybridGradientNumerics.unscale_and_clip(gradients,
-                                                           loss_scale,
-                                                           clip_grad,
-                                                           process_group=self._adapter.get_data_parallel_group())
+        numerics = HybridGradientNumerics.unscale_and_clip(
+            gradients,
+            loss_scale,
+            clip_grad,
+            process_group=self._adapter.get_data_parallel_group(),
+            communication_device=(get_accelerator().current_device_name() if self._cpu_second else None))
         if numerics.overflow:
             self._pipeline.complete_step(overflow=True)
             return TakeoverStepResult(numerics, 0, None)
@@ -163,10 +178,21 @@ class Zero2TakeoverRuntime:
         self._pipeline.complete_step(overflow=False)
         return TakeoverStepResult(numerics, first_updated, submitted_version)
 
-    def _native_boundary_step(self, loss_scale: float, clip_grad: float) -> TakeoverStepResult:
+    def _native_boundary_step(self, loss_scale: float, clip_grad: float,
+                              batch: TakeoverGradientBatch) -> TakeoverStepResult:
         if self._metrics is not None:
             self._metrics.increment("takeover_native_boundary_count")
         overflow, global_norm, combined_scale = self._adapter.compute_native_gradient_numerics(loss_scale, clip_grad)
+        if self._cpu_second:
+            second_gradients = [value for reduced in batch.second.values() for value in reduced.values.values()]
+            second_numerics = HybridGradientNumerics.unscale_and_clip(
+                second_gradients, 1.0, 0.0, process_group=self._adapter.get_cpu_owner_group())
+            # Native sees only A/C; add the globally reduced B norm before choosing ONE clipping scale.
+            overflow = overflow or second_numerics.overflow
+            global_norm = (global_norm**2 + (second_numerics.global_norm / loss_scale)**2)**0.5
+            combined_scale = loss_scale
+            if clip_grad > 0.0 and global_norm > clip_grad:
+                combined_scale *= global_norm / clip_grad
         if self._native_transfer_event is None:
             raise RuntimeError("Native boundary transfer event is unavailable")
         self._native_transfer_event.synchronize()
@@ -184,9 +210,17 @@ class Zero2TakeoverRuntime:
             for group_values in values_by_group.values():
                 for values in group_values.values():
                     values.mul_(inverse_scale)
+        if self._cpu_second:
+            for reduced in batch.second.values():
+                for values in reduced.values.values():
+                    values.mul_(inverse_scale)
         values_by_band = (self._native_first, self._native_second, self._native_dense)
         reduced_bands = []
         for band, values_by_group in enumerate(values_by_band):
+            if self._cpu_second and band == 1:
+                reduced_bands.append(batch.second)
+                self._native_columns[band].update(batch.second_columns)
+                continue
             reduced_by_group = {}
             for group_id, group_values in values_by_group.items():
                 group_columns = {
@@ -228,6 +262,8 @@ class Zero2TakeoverRuntime:
                            torch.arange(layout.shape[1], dtype=torch.long)[mask])
             rank = self._adapter.get_partition_rank(layout.group_id)
             for band, parameter_columns in enumerate(columns):
+                if self._cpu_second and band == 1:
+                    continue
                 if parameter_columns is None or parameter_columns.numel() == 0:
                     continue
                 destination = destinations[band].setdefault(layout.group_id, {})
@@ -252,12 +288,16 @@ class Zero2TakeoverRuntime:
 
     def state_dict(self):
         return {
+            "second_reduce_scatter_device": "cpu" if self._cpu_second else "gpu",
             "pipeline": self._pipeline.state_dict(),
             "gpu_updater": self._gpu_updater.state_dict(),
             "cpu_updater": self._cpu_updater.state_dict(),
         }
 
     def load_state_dict(self, state_dict) -> None:
+        expected_device = "cpu" if self._cpu_second else "gpu"
+        if state_dict.get("second_reduce_scatter_device", "gpu") != expected_device:
+            raise ValueError("Cannot change B reduce-scatter device when restoring a takeover checkpoint")
         self._pipeline.load_state_dict(state_dict["pipeline"])
         device = torch.device(get_accelerator().current_device_name())
         self._gpu_updater.load_state_dict(state_dict["gpu_updater"], device)
@@ -332,6 +372,9 @@ class Zero2TakeoverRuntime:
 
     def close(self) -> None:
         self._cpu_updater.close()
+        self._pipeline.close()
+        if self._cpu_second:
+            self._adapter.close_cpu_owner_group()
         if self._selective_configured:
             for parameter_id in self._layouts:
                 if self._importance_registry.get(parameter_id) is not None:
